@@ -34,465 +34,318 @@ CHECKER_HEADERS = {
 }
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
-
 user_sessions = {}
 
-# ----------------- Chinese Names -----------------
+# ----------------- Clean Chinese Names -----------------
 CHINESE_NAMES = [
-    "张伟", "王芳", "李娜", "刘敏", "陈静", "杨秀英", "黄丽", "赵强", 
-    "周磊", "吴军", "徐洋", "孙勇", "马艳", "朱杰", "胡娟", "郭涛", 
-    "何明", "高超", "林浩", "郑宇", "李子轩", "王若曦", "陈思源", "张梓涵"
+    "李子轩", "王若曦", "陈思源", "张梓涵", "刘雨泽", "杨晨", "黄子涵",
+    "赵雨辰", "周俊杰", "吴雨轩", "张伟", "王芳", "李娜", "刘敏", "陈静"
 ]
-
-CHINESE_BIOS = [
-    "保持热爱，奔赴山海。",
-    "生活明朗，万物可爱。",
-    "顺其自然，随遇而安。",
-    "知足常乐，珍惜眼前。",
-    "热爱可抵岁月漫长。"
-]
-
-def generate_chinese_profile():
-    return random.choice(CHINESE_NAMES), random.choice(CHINESE_BIOS)
 
 # ----------------- Database Setup -----------------
 def init_db():
     conn = sqlite3.connect("bot_data.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS stats (
-            user_id INTEGER PRIMARY KEY,
-            otp_count INTEGER DEFAULT 0
-        )
-    """)
-    # স্থায়ীভাবে ব্যবহৃত নম্বরের তালিকা
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS used_numbers (
-            phone TEXT PRIMARY KEY,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+    c = conn.cursor()
+    c.execute("CREATE TABLE IF NOT EXISTS stats (user_id INTEGER PRIMARY KEY, count INTEGER DEFAULT 0)")
+    c.execute("CREATE TABLE IF NOT EXISTS used_numbers (phone TEXT PRIMARY KEY)")
     conn.commit()
     conn.close()
 
 init_db()
 
-def increment_otp_count(user_id):
+def mark_done(user_id, phone):
     conn = sqlite3.connect("bot_data.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO stats (user_id, otp_count) VALUES (?, 1)
-        ON CONFLICT(user_id) DO UPDATE SET otp_count = otp_count + 1
-    """, (user_id,))
+    c = conn.cursor()
+    c.execute("INSERT INTO stats (user_id, count) VALUES (?, 1) ON CONFLICT(user_id) DO UPDATE SET count = count + 1", (user_id,))
+    clean_p = re.sub(r'\D', '', str(phone))
+    c.execute("INSERT OR IGNORE INTO used_numbers (phone) VALUES (?)", (clean_p,))
     conn.commit()
     conn.close()
 
-def get_otp_count(user_id):
-    conn = sqlite3.connect("bot_data.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT otp_count FROM stats WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    conn.close()
-    return row[0] if row else 0
-
-def is_number_previously_used(phone):
-    """চেক করে নম্বরটিতে আগে ওটিপি এসেছে কি না"""
+def is_used(phone):
     clean_p = re.sub(r'\D', '', str(phone))
     conn = sqlite3.connect("bot_data.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT phone FROM used_numbers WHERE phone = ? OR phone LIKE ?", (clean_p, f"%{clean_p}%"))
-    row = cursor.fetchone()
+    c = conn.cursor()
+    c.execute("SELECT phone FROM used_numbers WHERE phone = ?", (clean_p,))
+    r = c.fetchone()
     conn.close()
-    return row is not None
-
-def mark_number_consumed_permanently(phone):
-    """ডাটাবেজে এবং IPRN সার্ভারে নম্বরটিকে Consumed হিসেবে রেজিস্টার করে"""
-    clean_p = re.sub(r'\D', '', str(phone))
-    conn = sqlite3.connect("bot_data.db")
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR IGNORE INTO used_numbers (phone) VALUES (?)", (clean_p,))
-    conn.commit()
-    conn.close()
-
-    # IPRN API-তে নম্বরটি ব্লক/Consumed হিসেবে ইমপোর্ট করা
-    try:
-        url = f"{BASE_URL}/activations/import-consumed?phones={clean_p}"
-        requests.post(url, headers=HEADERS, timeout=5)
-    except Exception as e:
-        print(f"[IMPORT CONSUMED ERROR] {e}")
+    return r is not None
 
 # ----------------- Fast OTP Extractor -----------------
-def extract_otp(text):
+def get_code(text):
     if not text:
-        return "N/A"
-    m = re.search(r'(?:code|kod|código|verification|login)[\s:]*([0-9\-\s]{4,8})', text, re.IGNORECASE)
+        return None
+    # 5 or 6 digit Telegram code
+    m = re.search(r'(?:code|kod|código|verification|login)[\s:]*([0-9]{4,8})', text, re.IGNORECASE)
     if m:
-        c = re.sub(r'\D', '', m.group(1))
-        if 4 <= len(c) <= 8:
-            return c
-    digits = re.findall(r'\b\d{4,8}\b', text)
+        return m.group(1)
+    digits = re.findall(r'\b\d{5,6}\b', text)
     if digits:
         return digits[0]
-    return "SEE_TEXT"
+    return None
 
-# ----------------- Checker Logic -----------------
-FRESH_KEYWORDS = {"unoccupied", "unregistered", "not_registered", "free", "fresh", "available", "false", "0", 0, False}
-
-def check_number_tg_status(phone: str) -> str:
+# ----------------- TG Checker -----------------
+def is_fresh(phone):
     cleaned = phone if str(phone).startswith("+") else f"+{phone}"
-    payload = {"numbers": [cleaned]}
     try:
-        r = requests.post(CHECKER_API_URL, json=payload, headers=CHECKER_HEADERS, timeout=6)
+        r = requests.post(CHECKER_API_URL, json={"numbers": [cleaned]}, headers=CHECKER_HEADERS, timeout=5)
         if r.status_code == 200:
-            data = r.json()
-            if isinstance(data, dict):
-                num_data = data.get(cleaned, {})
-                status = str(num_data.get("status", "")).lower()
-                registered = num_data.get("registered", None)
+            res = r.json().get(cleaned, {})
+            st = str(res.get("status", "")).lower()
+            reg = res.get("registered", None)
+            if "ban" in st or "flood" in st or "locked" in st or st in ["occupied", "registered", "taken", "used"] or reg is True:
+                return False
+            return True
+    except Exception:
+        pass
+    return True
 
-                if status in FRESH_KEYWORDS or registered is False:
-                    return "fresh"
-                elif "ban" in status:
-                    return "banned"
-                elif status in ["occupied", "registered", "taken", "used", "true", "1", 1] or registered is True:
-                    return "occupied"
-                elif status in ["flood", "locked", "lock", "wait", "restricted", "2fa"]:
-                    return "locked"
-    except Exception as e:
-        print(f"[CHECKER ERROR] {e}")
-    return "unknown"
-
-# ----------------- IPRN API Helpers -----------------
-def get_balance():
+# ----------------- IPRN Functions -----------------
+def api_balance():
     try:
         r = requests.get(f"{BASE_URL}/balance", headers=HEADERS, timeout=5)
         if r.status_code == 200:
-            data = r.json()
-            return f"{data.get('amount')} {data.get('currency')}"
+            d = r.json()
+            return f"{d.get('amount')} {d.get('currency')}"
     except Exception:
         pass
     return "Error"
 
-def get_first_available_product():
+def reserve_number():
     try:
         r = requests.get(f"{BASE_URL}/activation-products", headers=HEADERS, timeout=5)
-        if r.status_code == 200:
-            products = r.json().get("data", [])
-            for p in products:
-                if p.get("available", 0) > 0:
-                    return p.get("destination"), p.get("payment_terms")
-    except Exception:
-        pass
-    return None, None
+        if r.status_code != 200:
+            return None, "Error"
+        prods = r.json().get("data", [])
+        prod = next((p for p in prods if p.get("available", 0) > 0), None)
+        if not prod:
+            return None, "No Stock"
 
-def reserve_number():
-    dest, terms = get_first_available_product()
-    if not dest or not terms:
-        return None, "No stock"
-    
-    url = f"{BASE_URL}/activations?destination={requests.utils.quote(dest)}&payment_terms={requests.utils.quote(terms)}"
-    try:
+        dest = prod.get("destination")
+        terms = prod.get("payment_terms")
+        url = f"{BASE_URL}/activations?destination={requests.utils.quote(dest)}&payment_terms={requests.utils.quote(terms)}"
         r = requests.post(url, headers=HEADERS, timeout=6)
         if r.status_code == 201:
-            res = r.json()
-            return res.get("data", res), "OK"
-        elif r.status_code == 422:
-            return None, "No stock"
-    except Exception as e:
-        print(f"[RESERVE ERROR] {e}")
+            d = r.json()
+            return d.get("data", d), "OK"
+    except Exception:
+        pass
     return None, "Error"
 
-def cancel_activation(act_id):
-    if not act_id:
-        return
+def cancel_act(act_id):
+    if act_id:
+        try:
+            requests.delete(f"{BASE_URL}/activations/{act_id}?activation_id={act_id}", headers=HEADERS, timeout=5)
+        except Exception:
+            pass
+
+def fetch_sms(act_id, phone):
+    clean_p = re.sub(r'\D', '', str(phone))
+
+    # 1. Check Panel/EDR
     try:
-        requests.delete(f"{BASE_URL}/activations/{act_id}?activation_id={act_id}", headers=HEADERS, timeout=5)
+        today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+        r = requests.get(f"{BASE_URL}/edr?page=1&perPage=15&day={today}", headers=HEADERS, timeout=4)
+        if r.status_code == 200:
+            for item in r.json().get("data", []):
+                b_num = re.sub(r'\D', '', str(item.get("b_number", "")))
+                if b_num and (clean_p.endswith(b_num) or b_num.endswith(clean_p)):
+                    return item.get("message")
     except Exception:
         pass
 
-def check_sms_from_edr_and_activation(act_id, phone):
-    clean_phone = re.sub(r'\D', '', str(phone))
-
-    # ১. EDR API চেক
+    # 2. Check Activation endpoint
     try:
-        today_str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
-        edr_url = f"{BASE_URL}/edr?page=1&perPage=25&day={today_str}"
-        r = requests.get(edr_url, headers=HEADERS, timeout=5)
+        r = requests.get(f"{BASE_URL}/activations/{act_id}?activation_id={act_id}", headers=HEADERS, timeout=4)
         if r.status_code == 200:
-            edr_data = r.json().get("data", [])
-            for item in edr_data:
-                b_num = re.sub(r'\D', '', str(item.get("b_number", "")))
-                if b_num and (clean_phone.endswith(b_num) or b_num.endswith(clean_phone)):
-                    return item.get("message")
-    except Exception as e:
-        print(f"[EDR CHECK ERROR] {e}")
-
-    # ২. Activations API চেক
-    try:
-        act_url = f"{BASE_URL}/activations/{act_id}?activation_id={act_id}"
-        r = requests.get(act_url, headers=HEADERS, timeout=5)
-        if r.status_code == 200:
-            res = r.json().get("data", {})
-            messages = res.get("messages", [])
-            if messages and len(messages) > 0:
-                return messages[0].get("message")
-            if res.get("status") == "received" and res.get("message"):
-                return res.get("message")
-    except Exception as e:
-        print(f"[ACT CHECK ERROR] {e}")
+            data = r.json().get("data", {})
+            msgs = data.get("messages", [])
+            if msgs and len(msgs) > 0:
+                return msgs[0].get("message")
+            if data.get("status") == "received" and data.get("message"):
+                return data.get("message")
+    except Exception:
+        pass
 
     return None
 
-# ----------------- Message Formats -----------------
-def build_reserved_message(dest, phone, cn_name, cn_bio):
-    return (
-        f"📱 *New Number Reserved*\n\n"
-        f"Country: *{dest}*\n"
-        f"TG Status: *Fresh / Available* ✅\n"
-        f"Number: `+{phone}` (tap to copy)\n\n"
-        f"🇨🇳 *Telegram Anti-Freeze Setup:*\n"
-        f"• Full Name: `{cn_name}` (tap to copy)\n"
-        f"• Bio: `{cn_bio}`\n\n"
-        f"⏳ _Waiting for SMS..._"
+# ----------------- UI Builders -----------------
+def inline_menu(act_id):
+    m = types.InlineKeyboardMarkup()
+    m.row(
+        types.InlineKeyboardButton("🔄 Check Status", callback_data=f"chk_{act_id}"),
+        types.InlineKeyboardButton("🔁 Change", callback_data=f"chg_{act_id}"),
+        types.InlineKeyboardButton("❌ Cancel", callback_data=f"cnc_{act_id}")
     )
+    return m
 
-def build_success_message(phone, otp_code, raw_msg, cn_name, cn_bio):
-    code_display = f"`{otp_code}`" if otp_code != "SEE_TEXT" else "*(নিচের মেসেজে দেখুন)*"
+def main_kb():
+    k = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    k.row(types.KeyboardButton("📱 Get Number"), types.KeyboardButton("💰 Balance"))
+    return k
 
-    return (
-        f"✅ *SMS Received!*\n\n"
-        f"📱 Number: `+{phone}`\n"
-        f"🔑 OTP Code: {code_display} (tap to copy)\n\n"
-        f"🇨🇳 *Telegram Anti-Freeze Setup:*\n"
-        f"• Full Name: `{cn_name}`\n"
-        f"• Bio: `{cn_bio}`\n\n"
-        f"📩 Full Message:\n`{raw_msg}`"
-    )
-
-# ----------------- Keyboards -----------------
-def main_menu():
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.row(types.KeyboardButton("📱 Get Number"))
-    markup.row(types.KeyboardButton("💰 Balance"), types.KeyboardButton("📊 My Stats"))
-    return markup
-
-def action_inline_keyboard(act_id):
-    markup = types.InlineKeyboardMarkup()
-    markup.row(
-        types.InlineKeyboardButton("🔄 Refresh / Check OTP", callback_data=f"refresh_{act_id}")
-    )
-    markup.row(
-        types.InlineKeyboardButton("🔁 Change Number", callback_data=f"change_{act_id}"),
-        types.InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{act_id}")
-    )
-    return markup
-
-# ----------------- Worker Function -----------------
-def sms_polling_worker(chat_id, user_id, act_id, phone, msg_id, cn_name, cn_bio):
-    start_time = time.time()
-
-    while time.time() - start_time < 600:
-        session = user_sessions.get(user_id)
-        if not session or session.get("activation_id") != act_id or not session.get("thread_active"):
+# ----------------- Polling Worker -----------------
+def poll_sms(chat_id, user_id, act_id, phone, msg_id, name):
+    start = time.time()
+    while time.time() - start < 300: # 5 mins
+        sess = user_sessions.get(user_id)
+        if not sess or sess.get("act_id") != act_id or not sess.get("active"):
             break
 
-        raw_msg = check_sms_from_edr_and_activation(act_id, phone)
+        msg = fetch_sms(act_id, phone)
+        if msg:
+            code = get_code(msg) or "See Text Below"
+            mark_done(user_id, phone)
 
-        if raw_msg:
-            otp_code = extract_otp(raw_msg)
-            
-            increment_otp_count(user_id)
-            mark_number_consumed_permanently(phone)
-
-            text = build_success_message(phone, otp_code, raw_msg, cn_name, cn_bio)
+            out = (
+                f"✅ *OTP RECEIVED!*\n\n"
+                f"📱 Number: `+{phone}`\n"
+                f"🔑 Code: `{code}`\n"
+                f"👤 Name: `{name}`\n\n"
+                f"📩 *Message:*\n`{msg}`"
+            )
             try:
-                bot.edit_message_text(text, chat_id, msg_id)
+                bot.edit_message_text(out, chat_id, msg_id)
             except Exception:
-                bot.send_message(chat_id, text)
+                bot.send_message(chat_id, out)
 
             user_sessions.pop(user_id, None)
             break
 
         time.sleep(2)
 
-# ----------------- Core Flow With History Filter -----------------
-def fetch_fresh_number_loop(chat_id, user_id, status_msg_id):
-    max_retries = 8
-
-    for attempt in range(1, max_retries + 1):
-        session = user_sessions.get(user_id)
-        if not session or not session.get("thread_active"):
+# ----------------- Core Flow -----------------
+def process_number(chat_id, user_id, status_msg_id):
+    for _ in range(6):
+        sess = user_sessions.get(user_id)
+        if not sess or not sess.get("active"):
             return
-
-        try:
-            bot.edit_message_text(f"⏳ Reserving number... (Attempt {attempt})", chat_id, status_msg_id)
-        except Exception:
-            pass
 
         data, status = reserve_number()
-        if status == "No stock":
-            bot.edit_message_text("⚠️ *No numbers available in stock right now.*", chat_id, status_msg_id)
+        if status == "No Stock":
+            bot.edit_message_text("⚠️ *No numbers available in stock.*", chat_id, status_msg_id)
             user_sessions.pop(user_id, None)
             return
-        elif status == "Error" or not data:
-            bot.edit_message_text("❌ *Failed to get number from server.*", chat_id, status_msg_id)
-            user_sessions.pop(user_id, None)
-            return
-
-        act_id = data.get("id")
-        phone = data.get("phone")
-        dest = data.get("destination", "N/A")
-
-        # ১. আগে এই নম্বরে ওটিপি এসেছে কি না তা ডাটাবেজে ভেরিফাই করা
-        if is_number_previously_used(phone):
-            print(f"[REJECTED] {phone} was already used in history! Cancelling...")
-            cancel_activation(act_id)
+        elif not data or status != "OK":
             time.sleep(1)
             continue
 
-        try:
-            bot.edit_message_text(f"🔍 Checking TG status for `+{phone}`...", chat_id, status_msg_id)
-        except Exception:
-            pass
+        act_id = data.get("id")
+        phone = data.get("phone")
 
-        tg_status = check_number_tg_status(phone)
+        if is_used(phone):
+            cancel_act(act_id)
+            continue
 
-        # ২. চেকার ফ্রেশ বললে এবং পূর্ববর্তী ওটিপি না থাকলে কেবল ইউজারকে দেবে
-        if tg_status in ["fresh", "unknown"]:
-            cn_name, cn_bio = generate_chinese_profile()
+        if not is_fresh(phone):
+            cancel_act(act_id)
+            continue
 
-            session["activation_id"] = act_id
-            session["phone"] = phone
-            session["cn_name"] = cn_name
-            session["cn_bio"] = cn_bio
+        # Fresh Number Found!
+        name = random.choice(CHINESE_NAMES)
+        sess["act_id"] = act_id
+        sess["phone"] = phone
+        sess["name"] = name
 
-            text = build_reserved_message(dest, phone, cn_name, cn_bio)
-            bot.edit_message_text(text, chat_id, status_msg_id, reply_markup=action_inline_keyboard(act_id))
+        text = (
+            f"📱 Number: `+{phone}`\n"
+            f"👤 Name: `{name}`\n\n"
+            f"⏳ *Status:* Waiting for SMS..."
+        )
+        bot.edit_message_text(text, chat_id, status_msg_id, reply_markup=inline_menu(act_id))
 
-            t = threading.Thread(target=sms_polling_worker, args=(chat_id, user_id, act_id, phone, status_msg_id, cn_name, cn_bio))
-            t.daemon = True
-            t.start()
-            return
-        else:
-            cancel_activation(act_id)
-            time.sleep(1)
+        t = threading.Thread(target=poll_sms, args=(chat_id, user_id, act_id, phone, status_msg_id, name))
+        t.daemon = True
+        t.start()
+        return
 
-    bot.edit_message_text("⚠️ *Could not find a fresh number right now. Try again later.*", chat_id, status_msg_id)
+    bot.edit_message_text("❌ *Failed to get fresh number. Please try again.*", chat_id, status_msg_id)
     user_sessions.pop(user_id, None)
 
-def handle_get_or_change(message):
-    user_id = message.from_user.id
-    chat_id = message.chat.id
+def get_new_number_cmd(message):
+    uid = message.from_user.id
+    cid = message.chat.id
 
-    old_session = user_sessions.get(user_id)
-    if old_session:
-        old_session["thread_active"] = False
-        cancel_activation(old_session.get("activation_id"))
-        user_sessions.pop(user_id, None)
+    old = user_sessions.get(uid)
+    if old:
+        old["active"] = False
+        cancel_act(old.get("act_id"))
+        user_sessions.pop(uid, None)
 
-    wait_msg = bot.send_message(chat_id, "⏳ Contacting server...")
+    msg = bot.send_message(cid, "⏳ *Getting fresh number...*")
+    user_sessions[uid] = {"act_id": None, "phone": None, "active": True}
 
-    user_sessions[user_id] = {
-        "activation_id": None,
-        "phone": None,
-        "thread_active": True
-    }
-
-    t = threading.Thread(target=fetch_fresh_number_loop, args=(chat_id, user_id, wait_msg.message_id))
+    t = threading.Thread(target=process_number, args=(cid, uid, msg.message_id))
     t.daemon = True
     t.start()
 
-# ----------------- Message Handlers -----------------
+# ----------------- Handlers -----------------
 @bot.message_handler(commands=['start'])
-def start_cmd(message):
-    bot.send_message(
-        message.chat.id, 
-        "🤖 *IPRN TG Bot Ready.*\nSelect an option below:", 
-        reply_markup=main_menu()
-    )
+def start_h(m):
+    bot.send_message(m.chat.id, "🤖 *Bot Ready.* Press button below:", reply_markup=main_kb())
 
 @bot.message_handler(func=lambda m: m.text == "📱 Get Number")
-def btn_get_number(message):
-    handle_get_or_change(message)
+def get_h(m):
+    get_new_number_cmd(m)
 
 @bot.message_handler(func=lambda m: m.text == "💰 Balance")
-def btn_balance(message):
-    bal = get_balance()
-    bot.send_message(message.chat.id, f"💰 Balance: *{bal}*")
+def bal_h(m):
+    bot.send_message(m.chat.id, f"💰 Balance: *{api_balance()}*")
 
-@bot.message_handler(func=lambda m: m.text == "📊 My Stats")
-def btn_stats(message):
-    count = get_otp_count(message.from_user.id)
-    bot.send_message(message.chat.id, f"📊 Total OTPs Received: *{count}*")
+@bot.callback_query_handler(func=lambda c: True)
+def cb_h(c):
+    uid = c.from_user.id
+    cid = c.message.chat.id
+    data = c.data
 
-# ----------------- Inline Callbacks -----------------
-@bot.callback_query_handler(func=lambda call: True)
-def callback_handler(call):
-    user_id = call.from_user.id
-    chat_id = call.message.chat.id
-    data = call.data
-
-    if data.startswith("cancel_"):
+    if data.startswith("cnc_"):
         act_id = data.split("_")[1]
-        session = user_sessions.get(user_id)
-        if session and session.get("activation_id") == act_id:
-            session["thread_active"] = False
-            user_sessions.pop(user_id, None)
-        
-        cancel_activation(act_id)
-        bot.edit_message_text("❌ *Number cancelled and returned to pool.*", chat_id, call.message.message_id)
+        sess = user_sessions.get(uid)
+        if sess and sess.get("act_id") == act_id:
+            sess["active"] = False
+            user_sessions.pop(uid, None)
+        cancel_act(act_id)
+        bot.edit_message_text("❌ *Cancelled.*", cid, c.message.message_id)
 
-    elif data.startswith("change_"):
-        bot.answer_callback_query(call.id, "Changing number...")
-        handle_get_or_change(call.message)
+    elif data.startswith("chg_"):
+        bot.answer_callback_query(c.id, "Changing...")
+        get_new_number_cmd(c.message)
 
-    elif data.startswith("refresh_"):
+    elif data.startswith("chk_"):
         act_id = data.split("_")[1]
-        session = user_sessions.get(user_id)
-        
-        phone = session.get("phone", "") if session else ""
-        cn_name = session.get("cn_name", "李子轩") if session else "李子轩"
-        cn_bio = session.get("cn_bio", "生活明朗，万物可爱。") if session else "生活明朗，万物可爱。"
+        sess = user_sessions.get(uid)
+        phone = sess.get("phone", "") if sess else ""
+        name = sess.get("name", "李子轩") if sess else "李子轩"
 
-        raw_msg = check_sms_from_edr_and_activation(act_id, phone)
-        if raw_msg:
-            otp_code = extract_otp(raw_msg)
-            if session:
-                session["thread_active"] = False
-                user_sessions.pop(user_id, None)
-
-            increment_otp_count(user_id)
-            mark_number_consumed_permanently(phone)
-
-            text = build_success_message(phone, otp_code, raw_msg, cn_name, cn_bio)
-            try:
-                bot.edit_message_text(text, chat_id, call.message.message_id)
-            except Exception:
-                bot.send_message(chat_id, text)
-
-            bot.answer_callback_query(call.id, "SMS Received!")
+        msg = fetch_sms(act_id, phone)
+        if msg:
+            code = get_code(msg) or "See Text Below"
+            mark_done(uid, phone)
+            if sess:
+                sess["active"] = False
+                user_sessions.pop(uid, None)
+            out = (
+                f"✅ *OTP RECEIVED!*\n\n"
+                f"📱 Number: `+{phone}`\n"
+                f"🔑 Code: `{code}`\n"
+                f"👤 Name: `{name}`\n\n"
+                f"📩 *Message:*\n`{msg}`"
+            )
+            bot.edit_message_text(out, cid, c.message.message_id)
+            bot.answer_callback_query(c.id, "Received!")
         else:
-            bot.answer_callback_query(call.id, "No SMS yet, still waiting...", show_alert=False)
+            bot.answer_callback_query(c.id, "Still waiting for SMS...", show_alert=False)
 
-# ----------------- Render Dummy HTTP Server -----------------
-class SimpleHealthHandler(BaseHTTPRequestHandler):
+# ----------------- HTTP Health Server -----------------
+class H(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"Bot is alive!")
-
-    def log_message(self, format, *args):
+        self.wfile.write(b"OK")
+    def log_message(self, *args):
         return
 
-def run_http_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), SimpleHealthHandler)
-    server.serve_forever()
-
 if __name__ == "__main__":
-    http_thread = threading.Thread(target=run_http_server, daemon=True)
-    http_thread.start()
-
-    print("Bot running with Anti-Duplicate Filter...")
+    t = threading.Thread(target=lambda: HTTPServer(("0.0.0.0", int(os.environ.get("PORT", 8080))), H).serve_forever(), daemon=True)
+    t.start()
     bot.infinity_polling()
