@@ -21,7 +21,7 @@ CHECKER_AUTH = "user8354"
 CHECKER_API_KEY = "SIGUzg7Xf7euGs8B"
 
 # Tumar Telegram ID boshao
-ADMIN_IDS = [7601955364]
+ADMIN_IDS = [7266067201]
 
 HEADERS = {
     "Authorization": f"Bearer {IPRN_TOKEN}",
