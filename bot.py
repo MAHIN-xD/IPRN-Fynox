@@ -20,8 +20,8 @@ CHECKER_API_URL = "http://api.agbots.site:8080/check/"
 CHECKER_AUTH = "user8354"
 CHECKER_API_KEY = "SIGUzg7Xf7euGs8B"
 
-# আপনার Telegram Numeric ID এখানে বসান (উদা: [123456789])
-ADMIN_IDS = [7266067201]  # <- এখানে আপনার ID দিন
+# Tumar Telegram ID boshao
+ADMIN_IDS = [7601955364]
 
 HEADERS = {
     "Authorization": f"Bearer {IPRN_TOKEN}",
@@ -47,19 +47,15 @@ CHINESE_NAMES = [
     "徐洋", "孙勇", "马艳", "朱杰", "胡娟", "郭涛", "何明", "高超", "林浩", "郑宇",
     "谢天宇", "罗浩然", "宋嘉豪", "唐晓峰", "许志强", "韩建华", "邓文博", "冯伟伦", "曹宇轩", "彭明辉",
     "曾祥龙", "萧敬腾", "田思博", "董建国", "袁志远", "潘子轩", "于海洋", "蒋伟峰", "蔡文德", "余天赐",
-    "杜少卿", "叶俊熙", "苏明玉", "魏子安", "程飞龙", "吕秀才", "丁春秋", "沈万三", "任盈盈", "姚明哲",
-    "汪洋", "崔宇航", "钱学森", "贾宝玉", "夏洛", "顾里", "白敬亭", "陆小凤", "孟浩然", "郝运来"
+    "杜少卿", "叶俊熙", "苏明玉", "魏子安", "程飞龙", "吕秀才", "丁春秋", "沈万三", "任盈盈", "姚明哲"
 ]
 
 # ----------------- Database Setup -----------------
 def init_db():
     conn = sqlite3.connect("bot_data.db")
     c = conn.cursor()
-    # ব্যবহারকারী ওটিপি হিস্ট্রি
     c.execute("CREATE TABLE IF NOT EXISTS stats (user_id INTEGER PRIMARY KEY, count INTEGER DEFAULT 0)")
-    # অলরেডি ইস্যু হওয়া নম্বর
     c.execute("CREATE TABLE IF NOT EXISTS used_numbers (phone TEXT PRIMARY KEY)")
-    # ফাইল থেকে আপলোড করা নম্বরের পুল (is_used = 0 মানে এখনও কাউকেই দেওয়া হয়নি)
     c.execute("""
         CREATE TABLE IF NOT EXISTS file_numbers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,10 +77,10 @@ def get_user_otp_count(user_id):
     return r[0] if r else 0
 
 def increment_user_otp(user_id, phone):
+    clean_p = re.sub(r'\D', '', str(phone))
     conn = sqlite3.connect("bot_data.db")
     c = conn.cursor()
     c.execute("INSERT INTO stats (user_id, count) VALUES (?, 1) ON CONFLICT(user_id) DO UPDATE SET count = count + 1", (user_id,))
-    clean_p = re.sub(r'\D', '', str(phone))
     c.execute("INSERT OR IGNORE INTO used_numbers (phone) VALUES (?)", (clean_p,))
     c.execute("UPDATE file_numbers SET is_used = 1 WHERE phone = ?", (clean_p,))
     conn.commit()
@@ -100,16 +96,26 @@ def is_phone_used(phone):
     return r is not None
 
 def get_next_available_file_number():
-    """ফাইল থেকে সিরিয়ালি একটি অব্যবহৃত নম্বর নিয়ে আসবে"""
     conn = sqlite3.connect("bot_data.db")
     c = conn.cursor()
-    c.execute("SELECT id, phone FROM file_numbers WHERE is_used = 0 ORDER BY id ASC LIMIT 1")
-    row = c.fetchone()
-    if row:
-        c.execute("UPDATE file_numbers SET is_used = 1 WHERE id = ?", (row[0],))
+    c.execute("SELECT id, phone FROM file_numbers WHERE is_used = 0 ORDER BY id ASC")
+    rows = c.fetchall()
+    
+    for row_id, phone in rows:
+        clean_p = re.sub(r'\D', '', str(phone))
+        # Jodi already use hoye thake, skip and mark used
+        if is_phone_used(clean_p):
+            c.execute("UPDATE file_numbers SET is_used = 1 WHERE id = ?", (row_id,))
+            conn.commit()
+            continue
+        
+        # Lock number
+        c.execute("UPDATE file_numbers SET is_used = 1 WHERE id = ?", (row_id,))
+        c.execute("INSERT OR IGNORE INTO used_numbers (phone) VALUES (?)", (clean_p,))
         conn.commit()
         conn.close()
-        return row[1]
+        return clean_p
+        
     conn.close()
     return None
 
@@ -174,7 +180,7 @@ def reserve_number():
     return None, "Error"
 
 def cancel_act(act_id):
-    if act_id:
+    if act_id and act_id != "none":
         try:
             requests.delete(f"{BASE_URL}/activations/{act_id}?activation_id={act_id}", headers=HEADERS, timeout=5)
         except Exception:
@@ -186,7 +192,7 @@ def fetch_sms(act_id, phone):
     # 1. Check Panel/EDR
     try:
         today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
-        r = requests.get(f"{BASE_URL}/edr?page=1&perPage=20&day={today}", headers=HEADERS, timeout=4)
+        r = requests.get(f"{BASE_URL}/edr?page=1&perPage=25&day={today}", headers=HEADERS, timeout=4)
         if r.status_code == 200:
             for item in r.json().get("data", []):
                 b_num = re.sub(r'\D', '', str(item.get("b_number", "")))
@@ -195,8 +201,8 @@ def fetch_sms(act_id, phone):
     except Exception:
         pass
 
-    # 2. Check Activation endpoint (যদি act_id থাকে)
-    if act_id:
+    # 2. Check Activation endpoint
+    if act_id and act_id != "none":
         try:
             r = requests.get(f"{BASE_URL}/activations/{act_id}?activation_id={act_id}", headers=HEADERS, timeout=4)
             if r.status_code == 200:
@@ -229,7 +235,7 @@ def main_kb():
 # ----------------- Polling Worker -----------------
 def poll_sms(chat_id, user_id, act_id, phone, msg_id, name, my_otp_count):
     start = time.time()
-    while time.time() - start < 300: # 5 mins
+    while time.time() - start < 300: # 5 minutes timeout
         sess = user_sessions.get(user_id)
         if not sess or sess.get("phone") != phone or not sess.get("active"):
             break
@@ -262,14 +268,18 @@ def poll_sms(chat_id, user_id, act_id, phone, msg_id, name, my_otp_count):
 def process_number(chat_id, user_id, status_msg_id):
     my_otp_count = get_user_otp_count(user_id)
 
-    # ১. প্রথমে অ্যাডমিনের ফাইল পুল চেক করা
-    file_phone = get_next_available_file_number()
-    if file_phone:
+    # 1. Prothome file-er queue check korbe
+    while True:
+        file_phone = get_next_available_file_number()
+        if not file_phone:
+            break
+        
+        # TG checker run
         if check_tg(file_phone):
             name = random.choice(CHINESE_NAMES)
             sess = user_sessions.get(user_id)
             if sess:
-                sess["act_id"] = None
+                sess["act_id"] = "none"
                 sess["phone"] = file_phone
                 sess["name"] = name
                 sess["my_otp"] = my_otp_count
@@ -282,12 +292,12 @@ def process_number(chat_id, user_id, status_msg_id):
                 f"⏳ *Status:* Waiting for SMS..."
             )
             bot.edit_message_text(text, chat_id, status_msg_id, reply_markup=inline_menu("none"))
-            t = threading.Thread(target=poll_sms, args=(chat_id, user_id, None, file_phone, status_msg_id, name, my_otp_count))
+            t = threading.Thread(target=poll_sms, args=(chat_id, user_id, "none", file_phone, status_msg_id, name, my_otp_count))
             t.daemon = True
             t.start()
             return
 
-    # ২. ফাইল খালি থাকলে সরাসরি IPRN API থেকে চেষ্টা করা
+    # 2. File-e number na thakle IPRN API theke nibe
     for attempt in range(1, 7):
         sess = user_sessions.get(user_id)
         if not sess or not sess.get("active"):
@@ -319,6 +329,13 @@ def process_number(chat_id, user_id, status_msg_id):
             continue
 
         # Fresh Found!
+        clean_p = re.sub(r'\D', '', str(phone))
+        conn = sqlite3.connect("bot_data.db")
+        c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO used_numbers (phone) VALUES (?)", (clean_p,))
+        conn.commit()
+        conn.close()
+
         name = random.choice(CHINESE_NAMES)
         sess["act_id"] = act_id
         sess["phone"] = phone
@@ -359,7 +376,7 @@ def get_new_number_cmd(message):
     t.daemon = True
     t.start()
 
-# ----------------- Admin File Upload Logic -----------------
+# ----------------- Admin Panel & File Upload -----------------
 @bot.message_handler(commands=['admin'])
 def admin_cmd(message):
     if message.from_user.id not in ADMIN_IDS:
@@ -376,7 +393,7 @@ def admin_cmd(message):
         message.chat.id, 
         f"👑 *Admin Panel*\n\n"
         f"📦 *Unused Numbers in Queue:* `{remaining}`\n\n"
-        f"👉 Send me a file (`.txt`, `.csv`, `.xlsx`) with phone numbers to add to the pool."
+        f"👉 Upload `.txt`, `.csv`, or `.xlsx` file containing phone numbers."
     )
 
 @bot.message_handler(content_types=['document'])
@@ -388,7 +405,7 @@ def handle_file_upload(message):
     file_name = doc.file_name.lower()
 
     if not (file_name.endswith('.txt') or file_name.endswith('.csv') or file_name.endswith('.xlsx')):
-        bot.reply_to(message, "⚠️ Please upload a `.txt`, `.csv`, or `.xlsx` file.")
+        bot.reply_to(message, "⚠️ Only `.txt`, `.csv`, or `.xlsx` files are allowed.")
         return
 
     msg = bot.reply_to(message, "⏳ *Processing file...*")
@@ -422,23 +439,24 @@ def handle_file_upload(message):
         bot.edit_message_text(f"❌ *Failed to read file:* `{e}`", message.chat.id, msg.message_id)
         return
 
-    # ডেটাবেজে ইউনিক নম্বরগুলো পুশ করা
     added = 0
     conn = sqlite3.connect("bot_data.db")
     c = conn.cursor()
     for num in set(numbers):
         clean = re.sub(r'\D', '', str(num))
-        try:
-            c.execute("INSERT INTO file_numbers (phone, is_used) VALUES (?, 0)", (clean,))
-            added += 1
-        except Exception:
-            pass
+        # Jodi age thekei used na hoy, tobei pool-e dhukbe
+        if not is_phone_used(clean):
+            try:
+                c.execute("INSERT INTO file_numbers (phone, is_used) VALUES (?, 0)", (clean,))
+                added += 1
+            except Exception:
+                pass
     conn.commit()
     conn.close()
 
-    bot.edit_message_text(f"✅ *Upload Complete!*\n\n📥 Total Read: `{len(numbers)}`\n🆕 Added to Pool: `{added}`", message.chat.id, msg.message_id)
+    bot.edit_message_text(f"✅ *Upload Complete!*\n\n📥 Total Extracted: `{len(numbers)}`\n🆕 Added to Queue: `{added}`", message.chat.id, msg.message_id)
 
-# ----------------- Handlers -----------------
+# ----------------- Message Handlers -----------------
 @bot.message_handler(commands=['start'])
 def start_h(m):
     bot.send_message(m.chat.id, "🤖 *Bot Ready.* Press button below:", reply_markup=main_kb())
