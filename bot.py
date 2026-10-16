@@ -12,7 +12,7 @@ from telebot import types
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ----------------- Configuration -----------------
-BOT_TOKEN = "8676287522:AAGWr_LjYRGp-N4edxGj067pgWxS-O3u_KE"
+BOT_TOKEN = "8676287522:AAF4NXYAVyovEiVWZluC4q3QsKCGYFy9Zdw"
 IPRN_TOKEN = "241803|c4n8xh1N1Oy8dhbfIxBhCLl1EeMSQ36X76Cuj3lI4b40f61d"
 BASE_URL = "https://api.iprn.pro/api/stock/public"
 
