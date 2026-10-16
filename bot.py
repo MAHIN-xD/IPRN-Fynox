@@ -6,6 +6,7 @@ import threading
 import sqlite3
 import datetime
 import requests
+import pandas as pd
 import telebot
 from telebot import types
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -18,6 +19,9 @@ BASE_URL = "https://api.iprn.pro/api/stock/public"
 CHECKER_API_URL = "http://api.agbots.site:8080/check/"
 CHECKER_AUTH = "user8354"
 CHECKER_API_KEY = "SIGUzg7Xf7euGs8B"
+
+# আপনার Telegram Numeric ID এখানে বসান (উদা: [123456789])
+ADMIN_IDS = [7266067201]  # <- এখানে আপনার ID দিন
 
 HEADERS = {
     "Authorization": f"Bearer {IPRN_TOKEN}",
@@ -36,33 +40,57 @@ CHECKER_HEADERS = {
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 user_sessions = {}
 
-# ----------------- Clean Chinese Names -----------------
+# ----------------- Extended Chinese Names -----------------
 CHINESE_NAMES = [
-    "李子轩", "王若曦", "陈思源", "张梓涵", "刘雨泽", "杨晨", "黄子涵",
-    "赵雨辰", "周俊杰", "吴雨轩", "张伟", "王芳", "李娜", "刘敏", "陈静"
+    "李子轩", "王若曦", "陈思源", "张梓涵", "刘雨泽", "杨晨", "黄子涵", "赵雨辰", "周俊杰", "吴雨轩",
+    "张伟", "王芳", "李娜", "刘敏", "陈静", "杨秀英", "黄丽", "赵强", "周磊", "吴军",
+    "徐洋", "孙勇", "马艳", "朱杰", "胡娟", "郭涛", "何明", "高超", "林浩", "郑宇",
+    "谢天宇", "罗浩然", "宋嘉豪", "唐晓峰", "许志强", "韩建华", "邓文博", "冯伟伦", "曹宇轩", "彭明辉",
+    "曾祥龙", "萧敬腾", "田思博", "董建国", "袁志远", "潘子轩", "于海洋", "蒋伟峰", "蔡文德", "余天赐",
+    "杜少卿", "叶俊熙", "苏明玉", "魏子安", "程飞龙", "吕秀才", "丁春秋", "沈万三", "任盈盈", "姚明哲",
+    "汪洋", "崔宇航", "钱学森", "贾宝玉", "夏洛", "顾里", "白敬亭", "陆小凤", "孟浩然", "郝运来"
 ]
 
 # ----------------- Database Setup -----------------
 def init_db():
     conn = sqlite3.connect("bot_data.db")
     c = conn.cursor()
+    # ব্যবহারকারী ওটিপি হিস্ট্রি
     c.execute("CREATE TABLE IF NOT EXISTS stats (user_id INTEGER PRIMARY KEY, count INTEGER DEFAULT 0)")
+    # অলরেডি ইস্যু হওয়া নম্বর
     c.execute("CREATE TABLE IF NOT EXISTS used_numbers (phone TEXT PRIMARY KEY)")
+    # ফাইল থেকে আপলোড করা নম্বরের পুল (is_used = 0 মানে এখনও কাউকেই দেওয়া হয়নি)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS file_numbers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone TEXT UNIQUE,
+            is_used INTEGER DEFAULT 0
+        )
+    """)
     conn.commit()
     conn.close()
 
 init_db()
 
-def mark_done(user_id, phone):
+def get_user_otp_count(user_id):
+    conn = sqlite3.connect("bot_data.db")
+    c = conn.cursor()
+    c.execute("SELECT count FROM stats WHERE user_id = ?", (user_id,))
+    r = c.fetchone()
+    conn.close()
+    return r[0] if r else 0
+
+def increment_user_otp(user_id, phone):
     conn = sqlite3.connect("bot_data.db")
     c = conn.cursor()
     c.execute("INSERT INTO stats (user_id, count) VALUES (?, 1) ON CONFLICT(user_id) DO UPDATE SET count = count + 1", (user_id,))
     clean_p = re.sub(r'\D', '', str(phone))
     c.execute("INSERT OR IGNORE INTO used_numbers (phone) VALUES (?)", (clean_p,))
+    c.execute("UPDATE file_numbers SET is_used = 1 WHERE phone = ?", (clean_p,))
     conn.commit()
     conn.close()
 
-def is_used(phone):
+def is_phone_used(phone):
     clean_p = re.sub(r'\D', '', str(phone))
     conn = sqlite3.connect("bot_data.db")
     c = conn.cursor()
@@ -71,11 +99,24 @@ def is_used(phone):
     conn.close()
     return r is not None
 
+def get_next_available_file_number():
+    """ফাইল থেকে সিরিয়ালি একটি অব্যবহৃত নম্বর নিয়ে আসবে"""
+    conn = sqlite3.connect("bot_data.db")
+    c = conn.cursor()
+    c.execute("SELECT id, phone FROM file_numbers WHERE is_used = 0 ORDER BY id ASC LIMIT 1")
+    row = c.fetchone()
+    if row:
+        c.execute("UPDATE file_numbers SET is_used = 1 WHERE id = ?", (row[0],))
+        conn.commit()
+        conn.close()
+        return row[1]
+    conn.close()
+    return None
+
 # ----------------- Fast OTP Extractor -----------------
 def get_code(text):
     if not text:
         return None
-    # 5 or 6 digit Telegram code
     m = re.search(r'(?:code|kod|código|verification|login)[\s:]*([0-9]{4,8})', text, re.IGNORECASE)
     if m:
         return m.group(1)
@@ -85,7 +126,7 @@ def get_code(text):
     return None
 
 # ----------------- TG Checker -----------------
-def is_fresh(phone):
+def check_tg(phone):
     cleaned = phone if str(phone).startswith("+") else f"+{phone}"
     try:
         r = requests.post(CHECKER_API_URL, json={"numbers": [cleaned]}, headers=CHECKER_HEADERS, timeout=5)
@@ -145,7 +186,7 @@ def fetch_sms(act_id, phone):
     # 1. Check Panel/EDR
     try:
         today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
-        r = requests.get(f"{BASE_URL}/edr?page=1&perPage=15&day={today}", headers=HEADERS, timeout=4)
+        r = requests.get(f"{BASE_URL}/edr?page=1&perPage=20&day={today}", headers=HEADERS, timeout=4)
         if r.status_code == 200:
             for item in r.json().get("data", []):
                 b_num = re.sub(r'\D', '', str(item.get("b_number", "")))
@@ -154,18 +195,19 @@ def fetch_sms(act_id, phone):
     except Exception:
         pass
 
-    # 2. Check Activation endpoint
-    try:
-        r = requests.get(f"{BASE_URL}/activations/{act_id}?activation_id={act_id}", headers=HEADERS, timeout=4)
-        if r.status_code == 200:
-            data = r.json().get("data", {})
-            msgs = data.get("messages", [])
-            if msgs and len(msgs) > 0:
-                return msgs[0].get("message")
-            if data.get("status") == "received" and data.get("message"):
-                return data.get("message")
-    except Exception:
-        pass
+    # 2. Check Activation endpoint (যদি act_id থাকে)
+    if act_id:
+        try:
+            r = requests.get(f"{BASE_URL}/activations/{act_id}?activation_id={act_id}", headers=HEADERS, timeout=4)
+            if r.status_code == 200:
+                data = r.json().get("data", {})
+                msgs = data.get("messages", [])
+                if msgs and len(msgs) > 0:
+                    return msgs[0].get("message")
+                if data.get("status") == "received" and data.get("message"):
+                    return data.get("message")
+        except Exception:
+            pass
 
     return None
 
@@ -185,23 +227,25 @@ def main_kb():
     return k
 
 # ----------------- Polling Worker -----------------
-def poll_sms(chat_id, user_id, act_id, phone, msg_id, name):
+def poll_sms(chat_id, user_id, act_id, phone, msg_id, name, my_otp_count):
     start = time.time()
     while time.time() - start < 300: # 5 mins
         sess = user_sessions.get(user_id)
-        if not sess or sess.get("act_id") != act_id or not sess.get("active"):
+        if not sess or sess.get("phone") != phone or not sess.get("active"):
             break
 
         msg = fetch_sms(act_id, phone)
         if msg:
             code = get_code(msg) or "See Text Below"
-            mark_done(user_id, phone)
+            increment_user_otp(user_id, phone)
 
             out = (
                 f"✅ *OTP RECEIVED!*\n\n"
                 f"📱 Number: `+{phone}`\n"
                 f"🔑 Code: `{code}`\n"
-                f"👤 Name: `{name}`\n\n"
+                f"👤 Name: `{name}`\n"
+                f"📊 *Your Total OTPs:* `{my_otp_count + 1}`\n"
+                f"⚡ Status: *Active / Verified* ✅\n\n"
                 f"📩 *Message:*\n`{msg}`"
             )
             try:
@@ -216,14 +260,44 @@ def poll_sms(chat_id, user_id, act_id, phone, msg_id, name):
 
 # ----------------- Core Flow -----------------
 def process_number(chat_id, user_id, status_msg_id):
-    for _ in range(6):
+    my_otp_count = get_user_otp_count(user_id)
+
+    # ১. প্রথমে অ্যাডমিনের ফাইল পুল চেক করা
+    file_phone = get_next_available_file_number()
+    if file_phone:
+        if check_tg(file_phone):
+            name = random.choice(CHINESE_NAMES)
+            sess = user_sessions.get(user_id)
+            if sess:
+                sess["act_id"] = None
+                sess["phone"] = file_phone
+                sess["name"] = name
+                sess["my_otp"] = my_otp_count
+
+            text = (
+                f"📊 *Your Total OTPs:* `{my_otp_count}`\n\n"
+                f"📱 Number: `+{file_phone}` (tap to copy)\n"
+                f"👤 Name: `{name}` (tap to copy)\n"
+                f"⚡ TG Status: *Fresh / Unregistered* ✅\n\n"
+                f"⏳ *Status:* Waiting for SMS..."
+            )
+            bot.edit_message_text(text, chat_id, status_msg_id, reply_markup=inline_menu("none"))
+            t = threading.Thread(target=poll_sms, args=(chat_id, user_id, None, file_phone, status_msg_id, name, my_otp_count))
+            t.daemon = True
+            t.start()
+            return
+
+    # ২. ফাইল খালি থাকলে সরাসরি IPRN API থেকে চেষ্টা করা
+    for attempt in range(1, 7):
         sess = user_sessions.get(user_id)
         if not sess or not sess.get("active"):
             return
 
+        bot.edit_message_text(f"⏳ *Reserving number... (Attempt {attempt})*", chat_id, status_msg_id)
+
         data, status = reserve_number()
         if status == "No Stock":
-            bot.edit_message_text("⚠️ *No numbers available in stock.*", chat_id, status_msg_id)
+            bot.edit_message_text("⚠️ *No numbers available in stock right now.*", chat_id, status_msg_id)
             user_sessions.pop(user_id, None)
             return
         elif not data or status != "OK":
@@ -233,28 +307,34 @@ def process_number(chat_id, user_id, status_msg_id):
         act_id = data.get("id")
         phone = data.get("phone")
 
-        if is_used(phone):
+        if is_phone_used(phone):
             cancel_act(act_id)
             continue
 
-        if not is_fresh(phone):
+        bot.edit_message_text(f"🔍 *Checking TG status for `+{phone}`...*", chat_id, status_msg_id)
+
+        if not check_tg(phone):
             cancel_act(act_id)
+            time.sleep(1)
             continue
 
-        # Fresh Number Found!
+        # Fresh Found!
         name = random.choice(CHINESE_NAMES)
         sess["act_id"] = act_id
         sess["phone"] = phone
         sess["name"] = name
+        sess["my_otp"] = my_otp_count
 
         text = (
-            f"📱 Number: `+{phone}`\n"
-            f"👤 Name: `{name}`\n\n"
+            f"📊 *Your Total OTPs:* `{my_otp_count}`\n\n"
+            f"📱 Number: `+{phone}` (tap to copy)\n"
+            f"👤 Name: `{name}` (tap to copy)\n"
+            f"⚡ TG Status: *Fresh / Unregistered* ✅\n\n"
             f"⏳ *Status:* Waiting for SMS..."
         )
         bot.edit_message_text(text, chat_id, status_msg_id, reply_markup=inline_menu(act_id))
 
-        t = threading.Thread(target=poll_sms, args=(chat_id, user_id, act_id, phone, status_msg_id, name))
+        t = threading.Thread(target=poll_sms, args=(chat_id, user_id, act_id, phone, status_msg_id, name, my_otp_count))
         t.daemon = True
         t.start()
         return
@@ -272,12 +352,91 @@ def get_new_number_cmd(message):
         cancel_act(old.get("act_id"))
         user_sessions.pop(uid, None)
 
-    msg = bot.send_message(cid, "⏳ *Getting fresh number...*")
+    msg = bot.send_message(cid, "⏳ *Contacting server...*")
     user_sessions[uid] = {"act_id": None, "phone": None, "active": True}
 
     t = threading.Thread(target=process_number, args=(cid, uid, msg.message_id))
     t.daemon = True
     t.start()
+
+# ----------------- Admin File Upload Logic -----------------
+@bot.message_handler(commands=['admin'])
+def admin_cmd(message):
+    if message.from_user.id not in ADMIN_IDS:
+        bot.reply_to(message, "⛔ *You are not authorized.*")
+        return
+    
+    conn = sqlite3.connect("bot_data.db")
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM file_numbers WHERE is_used = 0")
+    remaining = c.fetchone()[0]
+    conn.close()
+
+    bot.send_message(
+        message.chat.id, 
+        f"👑 *Admin Panel*\n\n"
+        f"📦 *Unused Numbers in Queue:* `{remaining}`\n\n"
+        f"👉 Send me a file (`.txt`, `.csv`, `.xlsx`) with phone numbers to add to the pool."
+    )
+
+@bot.message_handler(content_types=['document'])
+def handle_file_upload(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    doc = message.document
+    file_name = doc.file_name.lower()
+
+    if not (file_name.endswith('.txt') or file_name.endswith('.csv') or file_name.endswith('.xlsx')):
+        bot.reply_to(message, "⚠️ Please upload a `.txt`, `.csv`, or `.xlsx` file.")
+        return
+
+    msg = bot.reply_to(message, "⏳ *Processing file...*")
+    file_info = bot.get_file(doc.file_id)
+    downloaded = bot.download_file(file_info.file_path)
+
+    numbers = []
+    try:
+        if file_name.endswith('.txt'):
+            lines = downloaded.decode('utf-8', errors='ignore').splitlines()
+            for line in lines:
+                nums = re.findall(r'\b\d{10,15}\b', line)
+                numbers.extend(nums)
+        elif file_name.endswith('.csv'):
+            with open("temp.csv", "wb") as f:
+                f.write(downloaded)
+            df = pd.read_csv("temp.csv")
+            for col in df.columns:
+                nums = df[col].astype(str).str.extractall(r'(\d{10,15})')[0].tolist()
+                numbers.extend(nums)
+            os.remove("temp.csv")
+        elif file_name.endswith('.xlsx'):
+            with open("temp.xlsx", "wb") as f:
+                f.write(downloaded)
+            df = pd.read_excel("temp.xlsx")
+            for col in df.columns:
+                nums = df[col].astype(str).str.extractall(r'(\d{10,15})')[0].tolist()
+                numbers.extend(nums)
+            os.remove("temp.xlsx")
+    except Exception as e:
+        bot.edit_message_text(f"❌ *Failed to read file:* `{e}`", message.chat.id, msg.message_id)
+        return
+
+    # ডেটাবেজে ইউনিক নম্বরগুলো পুশ করা
+    added = 0
+    conn = sqlite3.connect("bot_data.db")
+    c = conn.cursor()
+    for num in set(numbers):
+        clean = re.sub(r'\D', '', str(num))
+        try:
+            c.execute("INSERT INTO file_numbers (phone, is_used) VALUES (?, 0)", (clean,))
+            added += 1
+        except Exception:
+            pass
+    conn.commit()
+    conn.close()
+
+    bot.edit_message_text(f"✅ *Upload Complete!*\n\n📥 Total Read: `{len(numbers)}`\n🆕 Added to Pool: `{added}`", message.chat.id, msg.message_id)
 
 # ----------------- Handlers -----------------
 @bot.message_handler(commands=['start'])
@@ -301,10 +460,11 @@ def cb_h(c):
     if data.startswith("cnc_"):
         act_id = data.split("_")[1]
         sess = user_sessions.get(uid)
-        if sess and sess.get("act_id") == act_id:
+        if sess and sess.get("phone"):
             sess["active"] = False
             user_sessions.pop(uid, None)
-        cancel_act(act_id)
+        if act_id != "none":
+            cancel_act(act_id)
         bot.edit_message_text("❌ *Cancelled.*", cid, c.message.message_id)
 
     elif data.startswith("chg_"):
@@ -316,11 +476,12 @@ def cb_h(c):
         sess = user_sessions.get(uid)
         phone = sess.get("phone", "") if sess else ""
         name = sess.get("name", "李子轩") if sess else "李子轩"
+        my_otp_count = sess.get("my_otp", 0) if sess else 0
 
-        msg = fetch_sms(act_id, phone)
+        msg = fetch_sms(act_id if act_id != "none" else None, phone)
         if msg:
             code = get_code(msg) or "See Text Below"
-            mark_done(uid, phone)
+            increment_user_otp(uid, phone)
             if sess:
                 sess["active"] = False
                 user_sessions.pop(uid, None)
@@ -328,7 +489,9 @@ def cb_h(c):
                 f"✅ *OTP RECEIVED!*\n\n"
                 f"📱 Number: `+{phone}`\n"
                 f"🔑 Code: `{code}`\n"
-                f"👤 Name: `{name}`\n\n"
+                f"👤 Name: `{name}`\n"
+                f"📊 *Your Total OTPs:* `{my_otp_count + 1}`\n"
+                f"⚡ Status: *Active / Verified* ✅\n\n"
                 f"📩 *Message:*\n`{msg}`"
             )
             bot.edit_message_text(out, cid, c.message.message_id)
