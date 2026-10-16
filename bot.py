@@ -8,6 +8,7 @@ import requests
 import telebot
 from telebot import types
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from google import genai
 
 # ----------------- Configuration -----------------
 BOT_TOKEN = "8676287522:AAGWr_LjYRGp-N4edxGj067pgWxS-O3u_KE"
@@ -18,6 +19,17 @@ BASE_URL = "https://api.iprn.pro/api/stock/public"
 CHECKER_API_URL = "http://api.agbots.site:8080/check/"
 CHECKER_AUTH = "user8354"
 CHECKER_API_KEY = "SIGUzg7Xf7euGs8B"
+
+# Gemini API Key (aistudio.google.com theke free key nite paren)
+GEMINI_API_KEY = "AQ.Ab8RN6J-kv3PB6lW426XDW8C9JH1ABigxUzG78cY9pDbB8hiTQ"
+
+# Initialize Gemini Client
+ai_client = None
+if GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_GEMINI_API_KEY_HERE":
+    try:
+        ai_client = genai.Client(api_key=GEMINI_API_KEY)
+    except Exception as e:
+        print(f"[GEMINI INIT ERROR] {e}")
 
 HEADERS = {
     "Authorization": f"Bearer {IPRN_TOKEN}",
@@ -38,24 +50,23 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 # Session state: {user_id: {"activation_id": ..., "phone": ..., "thread_active": bool}}
 user_sessions = {}
 
-# ----------------- Chinese Names Generator -----------------
-CHINESE_SURNAMES = ["王", "李", "张", "刘", "陈", "杨", "黄", "赵", "周", "吴", "徐", "孙", "马", "朱", "胡", "郭", "何", "高", "林", "郑"]
-CHINESE_GIVEN_NAMES = ["伟", "芳", "娜", "敏", "静", "秀英", "丽", "强", "磊", "军", "洋", "勇", "艳", "杰", "娟", "涛", "明", "超", "浩", "宇", "俊", "欣", "晨", "睿"]
+# ----------------- Fallback Chinese Names -----------------
+FALLBACK_FULL_NAMES = [
+    "张伟", "王芳", "李娜", "刘敏", "陈静", "杨秀英", "黄丽", "赵强", 
+    "周磊", "吴军", "徐洋", "孙勇", "马艳", "朱杰", "胡娟", "郭涛", 
+    "何明", "高超", "林浩", "郑宇", "李子轩", "王若曦", "陈思源", "张梓涵"
+]
 
-CHINESE_BIOS = [
+FALLBACK_BIOS = [
     "保持热爱，奔赴山海。",
     "生活明朗，万物可爱。",
     "顺其自然，随遇而安。",
     "知足常乐，珍惜眼前。",
-    "热爱可抵岁月漫长。",
-    "愿所有努力都不被辜负。"
+    "热爱可抵岁月漫长。"
 ]
 
-def generate_chinese_identity():
-    surname = random.choice(CHINESE_SURNAMES)
-    given_name = random.choice(CHINESE_GIVEN_NAMES)
-    bio = random.choice(CHINESE_BIOS)
-    return surname, given_name, bio
+def get_fallback_chinese():
+    return random.choice(FALLBACK_FULL_NAMES), random.choice(FALLBACK_BIOS)
 
 # ----------------- Database Setup -----------------
 def init_db():
@@ -102,22 +113,55 @@ def mark_number_used(phone):
     conn.commit()
     conn.close()
 
-# ----------------- OTP Extractor -----------------
-def extract_otp(text):
+# ----------------- Fast Local Regex -----------------
+def extract_otp_fast(text):
     if not text:
-        return "N/A"
-    
+        return None
+    # ১. টেলিগ্রাম কোড ম্যাচ
     m = re.search(r'(?:code|kod|código|verification|login)[\s:]*([0-9\-\s]{4,8})', text, re.IGNORECASE)
     if m:
-        cleaned = re.sub(r'\D', '', m.group(1))
-        if 4 <= len(cleaned) <= 8:
-            return cleaned
+        c = re.sub(r'\D', '', m.group(1))
+        if 4 <= len(c) <= 8:
+            return c
+    # ২. সরাসরি ৫ বা ৬ ডিজিটের নম্বর (টেলিগ্রাম সাধারণত ৫ ডিজিট পাঠায়)
+    digits = re.findall(r'\b\d{5,6}\b', text)
+    if digits:
+        return digits[0]
+    return None
 
-    numbers = re.findall(r'\b\d{4,8}\b', text)
-    if numbers:
-        return numbers[0]
+# ----------------- Gemini AI Parser -----------------
+def parse_with_gemini(raw_msg):
+    """Gemini Flash ব্যবহার করে সুপারফাস্ট ওটিপি এবং চাইনিজ ফুল নেম জেনারেট করে"""
+    if not ai_client:
+        return None, None, None
 
-    return "Check Text"
+    prompt = f"""You are an assistant for a Telegram SMS verification system.
+Read this SMS message carefully: "{raw_msg}"
+
+Tasks:
+1. Extract the exact login/verification code. (Only numeric digits, remove spaces/hyphens).
+2. Generate 1 realistic Chinese full name in Chinese characters (no spaces, 2 or 3 characters, e.g., 李子轩).
+3. Generate 1 short, positive Chinese bio/status in Chinese characters.
+
+Output STRICTLY in this JSON format and nothing else:
+{{"code": "12345", "name": "李子轩", "bio": "生活明朗，万物可爱。"}}
+"""
+    try:
+        response = ai_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt
+        )
+        text = response.text.strip()
+        # Parse JSON
+        m = re.search(r'\{.*\}', text, re.DOTALL)
+        if m:
+            import json
+            data = json.loads(m.group(0))
+            return data.get("code"), data.get("name"), data.get("bio")
+    except Exception as e:
+        print(f"[GEMINI ERROR] {e}")
+
+    return None, None, None
 
 # ----------------- Telegram Checker Logic -----------------
 FRESH_KEYWORDS = {"unoccupied", "unregistered", "not_registered", "free", "fresh", "available", "false", "0", 0, False}
@@ -143,7 +187,7 @@ def check_number_tg_status(phone: str) -> str:
                 elif status in ["flood", "locked", "lock", "wait", "restricted", "2fa"]:
                     return "locked"
     except Exception as e:
-        print(f"Checker Error: {e}")
+        print(f"[CHECKER ERROR] {e}")
     return "unknown"
 
 # ----------------- IPRN API Helpers -----------------
@@ -176,46 +220,84 @@ def reserve_number():
     
     url = f"{BASE_URL}/activations?destination={requests.utils.quote(dest)}&payment_terms={requests.utils.quote(terms)}"
     try:
-        r = requests.post(url, headers=HEADERS, timeout=5)
+        r = requests.post(url, headers=HEADERS, timeout=6)
         if r.status_code == 201:
-            data = r.json()
-            return data.get("data", data), "OK"
+            res = r.json()
+            return res.get("data", res), "OK"
         elif r.status_code == 422:
             return None, "No stock"
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[RESERVE ERROR] {e}")
     return None, "Error"
 
 def cancel_activation(act_id):
     if not act_id:
         return
     try:
-        requests.delete(f"{BASE_URL}/activations/{act_id}", headers=HEADERS, timeout=5)
+        requests.delete(f"{BASE_URL}/activations/{act_id}?activation_id={act_id}", headers=HEADERS, timeout=5)
     except Exception:
         pass
 
 def check_activation_sms(act_id):
     try:
-        r = requests.get(f"{BASE_URL}/activations/{act_id}", headers=HEADERS, timeout=6)
+        url = f"{BASE_URL}/activations/{act_id}?activation_id={act_id}"
+        r = requests.get(url, headers=HEADERS, timeout=6)
         if r.status_code == 200:
-            data = r.json()
-            return data.get("data", data)
-    except Exception:
-        pass
+            res = r.json()
+            return res.get("data", res)
+    except Exception as e:
+        print(f"[CHECK SMS ERROR] {e}")
+    return None
+
+def extract_message_text(data):
+    if not data or not isinstance(data, dict):
+        return None
+
+    messages = data.get("messages", [])
+    if isinstance(messages, list) and len(messages) > 0:
+        first_msg = messages[0]
+        if isinstance(first_msg, dict):
+            return first_msg.get("message") or first_msg.get("text")
+        elif isinstance(first_msg, str):
+            return first_msg
+
+    if data.get("message") and data.get("status") == "received":
+        return data.get("message")
+
+    if data.get("sms"):
+        return data.get("sms")
+
     return None
 
 # ----------------- Format Success Message -----------------
-def build_success_message(phone, otp_code, raw_msg):
-    surname, given_name, bio = generate_chinese_identity()
+def build_success_message(phone, raw_msg):
+    # ১. দ্রুত লোকাল পদ্ধতিতে ওটিপি খোঁজা
+    otp_code = extract_otp_fast(raw_msg)
+    ai_name, ai_bio = None, None
+
+    # ২. কোড না পেলে জেমিনিকে দিয়ে বের করা
+    if not otp_code and ai_client:
+        ai_code, ai_name, ai_bio = parse_with_gemini(raw_msg)
+        if ai_code:
+            otp_code = ai_code
+
+    # ৩. ফলব্যাক কোড
+    if not otp_code:
+        otp_code = "SEE_BELOW"
+
+    # নাম এবং বায়ো সেটআপ
+    if not ai_name:
+        ai_name, ai_bio = get_fallback_chinese()
+
+    code_display = f"`{otp_code}`" if otp_code != "SEE_BELOW" else "*(মেসেজে দেখুন)*"
+
     return (
         f"✅ *SMS Received!*\n\n"
         f"📱 Number: `+{phone}`\n"
-        f"🔑 Code: `{otp_code}`\n\n"
-        f"🇨🇳 *Telegram Anti-Freeze Setup:*\n"
-        f"• First Name: `{given_name}`\n"
-        f"• Last Name: `{surname}`\n"
-        f"• Full Name: `{surname}{given_name}`\n"
-        f"• Bio: `{bio}`\n\n"
+        f"🔑 Code: {code_display}\n\n"
+        f"🇨🇳 *Telegram Anti-Freeze Profile:*\n"
+        f"• Full Name: `{ai_name}` (tap to copy)\n"
+        f"• Bio: `{ai_bio}`\n\n"
         f"📩 Message:\n`{raw_msg}`"
     )
 
@@ -248,23 +330,17 @@ def sms_polling_worker(chat_id, user_id, act_id, phone, msg_id):
         data = check_activation_sms(act_id)
         if data:
             status = str(data.get("status", "")).lower()
-            messages = data.get("messages", [])
+            raw_msg = extract_message_text(data)
 
-            if messages or status == "received":
-                raw_msg = ""
-                if isinstance(messages, list) and len(messages) > 0:
-                    raw_msg = messages[0].get("message", "")
-                elif isinstance(messages, dict):
-                    raw_msg = messages.get("message", "")
+            if raw_msg or status == "received":
+                if not raw_msg:
+                    raw_msg = "SMS received (Status: received)"
 
-                otp_code = extract_otp(raw_msg)
-                
                 increment_otp_count(user_id)
                 mark_number_used(phone)
 
-                text = build_success_message(phone, otp_code, raw_msg)
+                text = build_success_message(phone, raw_msg)
                 try:
-                    # আগের নম্বরের মেসেজটা সরাসরি এডিট করে ওটিপি ও চাইনিজ প্রোফাইল বানিয়ে দেবে
                     bot.edit_message_text(text, chat_id, msg_id)
                 except Exception:
                     bot.send_message(chat_id, text)
@@ -408,18 +484,14 @@ def callback_handler(call):
         
         res = check_activation_sms(act_id)
         if res:
-            messages = res.get("messages", [])
             status = str(res.get("status", "")).lower()
+            raw_msg = extract_message_text(res)
 
-            if messages or status == "received":
-                raw_msg = ""
-                if isinstance(messages, list) and len(messages) > 0:
-                    raw_msg = messages[0].get("message", "")
-                elif isinstance(messages, dict):
-                    raw_msg = messages.get("message", "")
+            if raw_msg or status == "received":
+                if not raw_msg:
+                    raw_msg = "SMS received (Status: received)"
 
                 phone = res.get("phone", session.get("phone", "N/A") if session else "N/A")
-                otp_code = extract_otp(raw_msg)
 
                 if session:
                     session["thread_active"] = False
@@ -428,7 +500,7 @@ def callback_handler(call):
                 increment_otp_count(user_id)
                 mark_number_used(phone)
 
-                text = build_success_message(phone, otp_code, raw_msg)
+                text = build_success_message(phone, raw_msg)
                 try:
                     bot.edit_message_text(text, chat_id, call.message.message_id)
                 except Exception:
