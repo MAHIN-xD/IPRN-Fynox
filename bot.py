@@ -191,7 +191,7 @@ def fetch_sms(act_id, phone):
 
     # 1. Check Panel/EDR
     try:
-        today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+        today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
         r = requests.get(f"{BASE_URL}/edr?page=1&perPage=25&day={today}", headers=HEADERS, timeout=4)
         if r.status_code == 200:
             for item in r.json().get("data", []):
