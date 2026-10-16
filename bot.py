@@ -1,6 +1,7 @@
 import time
 import re
 import os
+import random
 import threading
 import sqlite3
 import requests
@@ -24,7 +25,6 @@ HEADERS = {
     "Accept": "application/json"
 }
 
-# Checker Headers with both Auth & API Key
 CHECKER_HEADERS = {
     "Content-Type": "application/json",
     "Authorization": CHECKER_AUTH,
@@ -37,6 +37,25 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 
 # Session state: {user_id: {"activation_id": ..., "phone": ..., "thread_active": bool}}
 user_sessions = {}
+
+# ----------------- Chinese Names Generator -----------------
+CHINESE_SURNAMES = ["王", "李", "张", "刘", "陈", "杨", "黄", "赵", "周", "吴", "徐", "孙", "马", "朱", "胡", "郭", "何", "高", "林", "郑"]
+CHINESE_GIVEN_NAMES = ["伟", "芳", "娜", "敏", "静", "秀英", "丽", "强", "磊", "军", "洋", "勇", "艳", "杰", "娟", "涛", "明", "超", "浩", "宇", "俊", "欣", "晨", "睿"]
+
+CHINESE_BIOS = [
+    "保持热爱，奔赴山海。",
+    "生活明朗，万物可爱。",
+    "顺其自然，随遇而安。",
+    "知足常乐，珍惜眼前。",
+    "热爱可抵岁月漫长。",
+    "愿所有努力都不被辜负。"
+]
+
+def generate_chinese_identity():
+    surname = random.choice(CHINESE_SURNAMES)
+    given_name = random.choice(CHINESE_GIVEN_NAMES)
+    bio = random.choice(CHINESE_BIOS)
+    return surname, given_name, bio
 
 # ----------------- Database Setup -----------------
 def init_db():
@@ -82,6 +101,23 @@ def mark_number_used(phone):
     cursor.execute("INSERT OR IGNORE INTO used_numbers (phone) VALUES (?)", (phone,))
     conn.commit()
     conn.close()
+
+# ----------------- OTP Extractor -----------------
+def extract_otp(text):
+    if not text:
+        return "N/A"
+    
+    m = re.search(r'(?:code|kod|código|verification|login)[\s:]*([0-9\-\s]{4,8})', text, re.IGNORECASE)
+    if m:
+        cleaned = re.sub(r'\D', '', m.group(1))
+        if 4 <= len(cleaned) <= 8:
+            return cleaned
+
+    numbers = re.findall(r'\b\d{4,8}\b', text)
+    if numbers:
+        return numbers[0]
+
+    return "Check Text"
 
 # ----------------- Telegram Checker Logic -----------------
 FRESH_KEYWORDS = {"unoccupied", "unregistered", "not_registered", "free", "fresh", "available", "false", "0", 0, False}
@@ -142,7 +178,8 @@ def reserve_number():
     try:
         r = requests.post(url, headers=HEADERS, timeout=5)
         if r.status_code == 201:
-            return r.json().get("data", {}), "OK"
+            data = r.json()
+            return data.get("data", data), "OK"
         elif r.status_code == 422:
             return None, "No stock"
     except Exception:
@@ -159,29 +196,48 @@ def cancel_activation(act_id):
 
 def check_activation_sms(act_id):
     try:
-        r = requests.get(f"{BASE_URL}/activations/{act_id}", headers=HEADERS, timeout=5)
+        r = requests.get(f"{BASE_URL}/activations/{act_id}", headers=HEADERS, timeout=6)
         if r.status_code == 200:
-            return r.json().get("data", {})
+            data = r.json()
+            return data.get("data", data)
     except Exception:
         pass
     return None
 
+# ----------------- Format Success Message -----------------
+def build_success_message(phone, otp_code, raw_msg):
+    surname, given_name, bio = generate_chinese_identity()
+    return (
+        f"✅ *SMS Received!*\n\n"
+        f"📱 Number: `+{phone}`\n"
+        f"🔑 Code: `{otp_code}`\n\n"
+        f"🇨🇳 *Telegram Anti-Freeze Setup:*\n"
+        f"• First Name: `{given_name}`\n"
+        f"• Last Name: `{surname}`\n"
+        f"• Full Name: `{surname}{given_name}`\n"
+        f"• Bio: `{bio}`\n\n"
+        f"📩 Message:\n`{raw_msg}`"
+    )
+
 # ----------------- Keyboards -----------------
 def main_menu():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.row(types.KeyboardButton("📱 Get Number"), types.KeyboardButton("🔄 Change Number"))
+    markup.row(types.KeyboardButton("📱 Get Number"))
     markup.row(types.KeyboardButton("💰 Balance"), types.KeyboardButton("📊 My Stats"))
     return markup
 
 def action_inline_keyboard(act_id):
     markup = types.InlineKeyboardMarkup()
     markup.row(
-        types.InlineKeyboardButton("🔄 Change Number", callback_data=f"change_{act_id}"),
+        types.InlineKeyboardButton("🔄 Refresh / Check OTP", callback_data=f"refresh_{act_id}")
+    )
+    markup.row(
+        types.InlineKeyboardButton("🔁 Change Number", callback_data=f"change_{act_id}"),
         types.InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{act_id}")
     )
     return markup
 
-# ----------------- Polling Worker -----------------
+# ----------------- Worker Function -----------------
 def sms_polling_worker(chat_id, user_id, act_id, phone, msg_id):
     start_time = time.time()
     while time.time() - start_time < 600:
@@ -191,29 +247,27 @@ def sms_polling_worker(chat_id, user_id, act_id, phone, msg_id):
 
         data = check_activation_sms(act_id)
         if data:
-            status = data.get("status")
+            status = str(data.get("status", "")).lower()
             messages = data.get("messages", [])
 
             if messages or status == "received":
-                msg_obj = messages[0] if messages else {}
-                raw_msg = msg_obj.get("message", "No text")
-                
-                code_match = re.search(r'\b\d{4,8}\b', raw_msg)
-                otp_code = code_match.group(0) if code_match else "N/A"
+                raw_msg = ""
+                if isinstance(messages, list) and len(messages) > 0:
+                    raw_msg = messages[0].get("message", "")
+                elif isinstance(messages, dict):
+                    raw_msg = messages.get("message", "")
 
+                otp_code = extract_otp(raw_msg)
+                
                 increment_otp_count(user_id)
                 mark_number_used(phone)
 
-                text = (
-                    f"✅ *SMS Received!*\n\n"
-                    f"📱 Number: `+{phone}`\n"
-                    f"🔑 Code: `{otp_code}`\n\n"
-                    f"📩 Message:\n_{raw_msg}_"
-                )
+                text = build_success_message(phone, otp_code, raw_msg)
                 try:
-                    bot.send_message(chat_id, text)
+                    # আগের নম্বরের মেসেজটা সরাসরি এডিট করে ওটিপি ও চাইনিজ প্রোফাইল বানিয়ে দেবে
+                    bot.edit_message_text(text, chat_id, msg_id)
                 except Exception:
-                    pass
+                    bot.send_message(chat_id, text)
 
                 user_sessions.pop(user_id, None)
                 break
@@ -317,10 +371,6 @@ def start_cmd(message):
 def btn_get_number(message):
     handle_get_or_change(message)
 
-@bot.message_handler(func=lambda m: m.text == "🔄 Change Number")
-def btn_change_number(message):
-    handle_get_or_change(message)
-
 @bot.message_handler(func=lambda m: m.text == "💰 Balance")
 def btn_balance(message):
     bal = get_balance()
@@ -351,6 +401,45 @@ def callback_handler(call):
     elif data.startswith("change_"):
         bot.answer_callback_query(call.id, "Changing number...")
         handle_get_or_change(call.message)
+
+    elif data.startswith("refresh_"):
+        act_id = data.split("_")[1]
+        session = user_sessions.get(user_id)
+        
+        res = check_activation_sms(act_id)
+        if res:
+            messages = res.get("messages", [])
+            status = str(res.get("status", "")).lower()
+
+            if messages or status == "received":
+                raw_msg = ""
+                if isinstance(messages, list) and len(messages) > 0:
+                    raw_msg = messages[0].get("message", "")
+                elif isinstance(messages, dict):
+                    raw_msg = messages.get("message", "")
+
+                phone = res.get("phone", session.get("phone", "N/A") if session else "N/A")
+                otp_code = extract_otp(raw_msg)
+
+                if session:
+                    session["thread_active"] = False
+                    user_sessions.pop(user_id, None)
+
+                increment_otp_count(user_id)
+                mark_number_used(phone)
+
+                text = build_success_message(phone, otp_code, raw_msg)
+                try:
+                    bot.edit_message_text(text, chat_id, call.message.message_id)
+                except Exception:
+                    bot.send_message(chat_id, text)
+
+                bot.answer_callback_query(call.id, "SMS Received!")
+                return
+            else:
+                bot.answer_callback_query(call.id, "No SMS yet, still waiting...", show_alert=False)
+        else:
+            bot.answer_callback_query(call.id, "Unable to check status right now.", show_alert=False)
 
 # ----------------- Render Dummy HTTP Server -----------------
 class SimpleHealthHandler(BaseHTTPRequestHandler):
