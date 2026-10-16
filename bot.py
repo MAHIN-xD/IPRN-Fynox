@@ -4,6 +4,7 @@ import os
 import random
 import threading
 import sqlite3
+import datetime
 import requests
 import telebot
 from telebot import types
@@ -20,12 +21,11 @@ CHECKER_API_URL = "http://api.agbots.site:8080/check/"
 CHECKER_AUTH = "user8354"
 CHECKER_API_KEY = "SIGUzg7Xf7euGs8B"
 
-# Gemini API Key (aistudio.google.com theke free key nite paren)
-GEMINI_API_KEY = "AQ.Ab8RN6J-kv3PB6lW426XDW8C9JH1ABigxUzG78cY9pDbB8hiTQ"
+# Gemini API Key (যদি থাকে দিন, না থাকলে ডিফল্টেই কাজ করবে)
+GEMINI_API_KEY = os.environ.get("AQ.Ab8RN6J-kv3PB6lW426XDW8C9JH1ABigxUzG78cY9pDbB8hiTQ", "")
 
-# Initialize Gemini Client
 ai_client = None
-if GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_GEMINI_API_KEY_HERE":
+if GEMINI_API_KEY:
     try:
         ai_client = genai.Client(api_key=GEMINI_API_KEY)
     except Exception as e:
@@ -47,26 +47,28 @@ CHECKER_HEADERS = {
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 
-# Session state: {user_id: {"activation_id": ..., "phone": ..., "thread_active": bool}}
+# Session state: {user_id: {"activation_id": ..., "phone": ..., "cn_name": ..., "cn_bio": ..., "thread_active": bool}}
 user_sessions = {}
 
-# ----------------- Fallback Chinese Names -----------------
-FALLBACK_FULL_NAMES = [
+# ----------------- Chinese Names -----------------
+CHINESE_NAMES = [
     "张伟", "王芳", "李娜", "刘敏", "陈静", "杨秀英", "黄丽", "赵强", 
     "周磊", "吴军", "徐洋", "孙勇", "马艳", "朱杰", "胡娟", "郭涛", 
-    "何明", "高超", "林浩", "郑宇", "李子轩", "王若曦", "陈思源", "张梓涵"
+    "何明", "高超", "林浩", "郑宇", "李子轩", "王若曦", "陈思源", "张梓涵",
+    "刘雨泽", "杨晨", "黄子涵", "赵雨辰", "周俊杰", "吴雨轩"
 ]
 
-FALLBACK_BIOS = [
+CHINESE_BIOS = [
     "保持热爱，奔赴山海。",
     "生活明朗，万物可爱。",
     "顺其自然，随遇而安。",
     "知足常乐，珍惜眼前。",
-    "热爱可抵岁月漫长。"
+    "热爱可抵岁月漫长。",
+    "日落归山海，山海藏深意。"
 ]
 
-def get_fallback_chinese():
-    return random.choice(FALLBACK_FULL_NAMES), random.choice(FALLBACK_BIOS)
+def generate_chinese_profile():
+    return random.choice(CHINESE_NAMES), random.choice(CHINESE_BIOS)
 
 # ----------------- Database Setup -----------------
 def init_db():
@@ -113,55 +115,24 @@ def mark_number_used(phone):
     conn.commit()
     conn.close()
 
-# ----------------- Fast Local Regex -----------------
-def extract_otp_fast(text):
+# ----------------- Fast OTP Extractor -----------------
+def extract_otp(text):
     if not text:
-        return None
-    # ১. টেলিগ্রাম কোড ম্যাচ
+        return "N/A"
+    
+    # টেলিগ্রাম স্পেসিফিক কোড
     m = re.search(r'(?:code|kod|código|verification|login)[\s:]*([0-9\-\s]{4,8})', text, re.IGNORECASE)
     if m:
         c = re.sub(r'\D', '', m.group(1))
         if 4 <= len(c) <= 8:
             return c
-    # ২. সরাসরি ৫ বা ৬ ডিজিটের নম্বর (টেলিগ্রাম সাধারণত ৫ ডিজিট পাঠায়)
-    digits = re.findall(r'\b\d{5,6}\b', text)
+
+    # টেক্সটে থাকা যেকোনো ৫ বা ৬ ডিজিটের নম্বর
+    digits = re.findall(r'\b\d{4,8}\b', text)
     if digits:
         return digits[0]
-    return None
 
-# ----------------- Gemini AI Parser -----------------
-def parse_with_gemini(raw_msg):
-    """Gemini Flash ব্যবহার করে সুপারফাস্ট ওটিপি এবং চাইনিজ ফুল নেম জেনারেট করে"""
-    if not ai_client:
-        return None, None, None
-
-    prompt = f"""You are an assistant for a Telegram SMS verification system.
-Read this SMS message carefully: "{raw_msg}"
-
-Tasks:
-1. Extract the exact login/verification code. (Only numeric digits, remove spaces/hyphens).
-2. Generate 1 realistic Chinese full name in Chinese characters (no spaces, 2 or 3 characters, e.g., 李子轩).
-3. Generate 1 short, positive Chinese bio/status in Chinese characters.
-
-Output STRICTLY in this JSON format and nothing else:
-{{"code": "12345", "name": "李子轩", "bio": "生活明朗，万物可爱。"}}
-"""
-    try:
-        response = ai_client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt
-        )
-        text = response.text.strip()
-        # Parse JSON
-        m = re.search(r'\{.*\}', text, re.DOTALL)
-        if m:
-            import json
-            data = json.loads(m.group(0))
-            return data.get("code"), data.get("name"), data.get("bio")
-    except Exception as e:
-        print(f"[GEMINI ERROR] {e}")
-
-    return None, None, None
+    return "SEE_TEXT"
 
 # ----------------- Telegram Checker Logic -----------------
 FRESH_KEYWORDS = {"unoccupied", "unregistered", "not_registered", "free", "fresh", "available", "false", "0", 0, False}
@@ -238,67 +209,68 @@ def cancel_activation(act_id):
     except Exception:
         pass
 
-def check_activation_sms(act_id):
+# ----------------- EDR ARCHIVE SMS CHECKER -----------------
+def check_sms_from_edr_and_activation(act_id, phone):
+    """
+    একই সাথে /edr (যেখানে প্যানেলের এসএমএস জমা হয়) এবং /activations দুটোই চেক করবে
+    """
+    clean_phone = re.sub(r'\D', '', str(phone))
+
+    # ১. EDR API চেক (প্যানেল যেখান থেকে এসএমএস পড়ে)
     try:
-        url = f"{BASE_URL}/activations/{act_id}?activation_id={act_id}"
-        r = requests.get(url, headers=HEADERS, timeout=6)
+        today_str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+        edr_url = f"{BASE_URL}/edr?page=1&perPage=15&day={today_str}"
+        r = requests.get(edr_url, headers=HEADERS, timeout=5)
         if r.status_code == 200:
-            res = r.json()
-            return res.get("data", res)
+            edr_data = r.json().get("data", [])
+            for item in edr_data:
+                b_num = re.sub(r'\D', '', str(item.get("b_number", "")))
+                # ফোন নম্বরের শেষ ৮-১০ ডিজিট মিললেই ওটিপি হিসেবে ধরবে
+                if b_num and (clean_phone.endswith(b_num) or b_num.endswith(clean_phone)):
+                    return item.get("message")
     except Exception as e:
-        print(f"[CHECK SMS ERROR] {e}")
-    return None
+        print(f"[EDR CHECK ERROR] {e}")
 
-def extract_message_text(data):
-    if not data or not isinstance(data, dict):
-        return None
-
-    messages = data.get("messages", [])
-    if isinstance(messages, list) and len(messages) > 0:
-        first_msg = messages[0]
-        if isinstance(first_msg, dict):
-            return first_msg.get("message") or first_msg.get("text")
-        elif isinstance(first_msg, str):
-            return first_msg
-
-    if data.get("message") and data.get("status") == "received":
-        return data.get("message")
-
-    if data.get("sms"):
-        return data.get("sms")
+    # ২. ফলব্যাক হিসেবে Activations API চেক
+    try:
+        act_url = f"{BASE_URL}/activations/{act_id}?activation_id={act_id}"
+        r = requests.get(act_url, headers=HEADERS, timeout=5)
+        if r.status_code == 200:
+            res = r.json().get("data", {})
+            messages = res.get("messages", [])
+            if messages and len(messages) > 0:
+                return messages[0].get("message")
+            if res.get("status") == "received" and res.get("message"):
+                return res.get("message")
+    except Exception as e:
+        print(f"[ACT CHECK ERROR] {e}")
 
     return None
 
-# ----------------- Format Success Message -----------------
-def build_success_message(phone, raw_msg):
-    # ১. দ্রুত লোকাল পদ্ধতিতে ওটিপি খোঁজা
-    otp_code = extract_otp_fast(raw_msg)
-    ai_name, ai_bio = None, None
+# ----------------- Format Reserved Message -----------------
+def build_reserved_message(dest, phone, cn_name, cn_bio):
+    return (
+        f"📱 *New Number Reserved*\n\n"
+        f"Country: *{dest}*\n"
+        f"TG Status: *Fresh / Available* ✅\n"
+        f"Number: `+{phone}` (tap to copy)\n\n"
+        f"🇨🇳 *Telegram Anti-Freeze Setup:*\n"
+        f"• Full Name: `{cn_name}` (tap to copy)\n"
+        f"• Bio: `{cn_bio}`\n\n"
+        f"⏳ _Waiting for SMS... (Checking Panel/EDR)_"
+    )
 
-    # ২. কোড না পেলে জেমিনিকে দিয়ে বের করা
-    if not otp_code and ai_client:
-        ai_code, ai_name, ai_bio = parse_with_gemini(raw_msg)
-        if ai_code:
-            otp_code = ai_code
-
-    # ৩. ফলব্যাক কোড
-    if not otp_code:
-        otp_code = "SEE_BELOW"
-
-    # নাম এবং বায়ো সেটআপ
-    if not ai_name:
-        ai_name, ai_bio = get_fallback_chinese()
-
-    code_display = f"`{otp_code}`" if otp_code != "SEE_BELOW" else "*(মেসেজে দেখুন)*"
+def build_success_message(phone, otp_code, raw_msg, cn_name, cn_bio):
+    code_display = f"`{otp_code}`" if otp_code != "SEE_TEXT" else "*(নিচের মেসেজে দেখুন)*"
 
     return (
         f"✅ *SMS Received!*\n\n"
         f"📱 Number: `+{phone}`\n"
-        f"🔑 Code: {code_display}\n\n"
-        f"🇨🇳 *Telegram Anti-Freeze Profile:*\n"
-        f"• Full Name: `{ai_name}` (tap to copy)\n"
-        f"• Bio: `{ai_bio}`\n\n"
-        f"📩 Message:\n`{raw_msg}`"
+        f"🔑 OTP Code: {code_display} (tap to copy)\n\n"
+        f"🇨🇳 *Telegram Anti-Freeze Setup:*\n"
+        f"• Full Name: `{cn_name}`\n"
+        f"• Bio: `{cn_bio}`\n\n"
+        f"📩 Full Message:\n`{raw_msg}`"
     )
 
 # ----------------- Keyboards -----------------
@@ -320,36 +292,33 @@ def action_inline_keyboard(act_id):
     return markup
 
 # ----------------- Worker Function -----------------
-def sms_polling_worker(chat_id, user_id, act_id, phone, msg_id):
+def sms_polling_worker(chat_id, user_id, act_id, phone, msg_id, cn_name, cn_bio):
     start_time = time.time()
+    print(f"[POLLING STARTED] User: {user_id} | Phone: {phone}")
+
     while time.time() - start_time < 600:
         session = user_sessions.get(user_id)
         if not session or session.get("activation_id") != act_id or not session.get("thread_active"):
             break
 
-        data = check_activation_sms(act_id)
-        if data:
-            status = str(data.get("status", "")).lower()
-            raw_msg = extract_message_text(data)
+        # প্যানেল/EDR থেকে এসএমএস খোঁজা
+        raw_msg = check_sms_from_edr_and_activation(act_id, phone)
 
-            if raw_msg or status == "received":
-                if not raw_msg:
-                    raw_msg = "SMS received (Status: received)"
+        if raw_msg:
+            print(f"[SMS FOUND VIA EDR/PANEL] Phone: {phone} -> Msg: {raw_msg}")
+            otp_code = extract_otp(raw_msg)
+            
+            increment_otp_count(user_id)
+            mark_number_used(phone)
 
-                increment_otp_count(user_id)
-                mark_number_used(phone)
+            text = build_success_message(phone, otp_code, raw_msg, cn_name, cn_bio)
+            try:
+                bot.edit_message_text(text, chat_id, msg_id)
+            except Exception:
+                bot.send_message(chat_id, text)
 
-                text = build_success_message(phone, raw_msg)
-                try:
-                    bot.edit_message_text(text, chat_id, msg_id)
-                except Exception:
-                    bot.send_message(chat_id, text)
-
-                user_sessions.pop(user_id, None)
-                break
-
-            if status in ["cancelled", "expired"]:
-                break
+            user_sessions.pop(user_id, None)
+            break
 
         time.sleep(2)
 
@@ -388,20 +357,19 @@ def fetch_fresh_number_loop(chat_id, user_id, status_msg_id):
 
         tg_status = check_number_tg_status(phone)
 
+        # নম্বর ফ্রেশ হলে সাথে সাথেই চাইনিজ নামসহ প্রিন্ট করে দেবে
         if tg_status in ["fresh", "unknown"]:
+            cn_name, cn_bio = generate_chinese_profile()
+
             session["activation_id"] = act_id
             session["phone"] = phone
+            session["cn_name"] = cn_name
+            session["cn_bio"] = cn_bio
 
-            text = (
-                f"📱 *New Number Reserved*\n\n"
-                f"Country: *{dest}*\n"
-                f"TG Status: *Fresh / Available* ✅\n"
-                f"Number: `+{phone}` (tap to copy)\n\n"
-                f"⏳ _Waiting for SMS..._"
-            )
+            text = build_reserved_message(dest, phone, cn_name, cn_bio)
             bot.edit_message_text(text, chat_id, status_msg_id, reply_markup=action_inline_keyboard(act_id))
 
-            t = threading.Thread(target=sms_polling_worker, args=(chat_id, user_id, act_id, phone, status_msg_id))
+            t = threading.Thread(target=sms_polling_worker, args=(chat_id, user_id, act_id, phone, status_msg_id, cn_name, cn_bio))
             t.daemon = True
             t.start()
             return
@@ -482,36 +450,29 @@ def callback_handler(call):
         act_id = data.split("_")[1]
         session = user_sessions.get(user_id)
         
-        res = check_activation_sms(act_id)
-        if res:
-            status = str(res.get("status", "")).lower()
-            raw_msg = extract_message_text(res)
+        phone = session.get("phone", "") if session else ""
+        cn_name = session.get("cn_name", "李子轩") if session else "李子轩"
+        cn_bio = session.get("cn_bio", "生活明朗，万物可爱。") if session else "生活明朗，万物可爱。"
 
-            if raw_msg or status == "received":
-                if not raw_msg:
-                    raw_msg = "SMS received (Status: received)"
+        raw_msg = check_sms_from_edr_and_activation(act_id, phone)
+        if raw_msg:
+            otp_code = extract_otp(raw_msg)
+            if session:
+                session["thread_active"] = False
+                user_sessions.pop(user_id, None)
 
-                phone = res.get("phone", session.get("phone", "N/A") if session else "N/A")
+            increment_otp_count(user_id)
+            mark_number_used(phone)
 
-                if session:
-                    session["thread_active"] = False
-                    user_sessions.pop(user_id, None)
+            text = build_success_message(phone, otp_code, raw_msg, cn_name, cn_bio)
+            try:
+                bot.edit_message_text(text, chat_id, call.message.message_id)
+            except Exception:
+                bot.send_message(chat_id, text)
 
-                increment_otp_count(user_id)
-                mark_number_used(phone)
-
-                text = build_success_message(phone, raw_msg)
-                try:
-                    bot.edit_message_text(text, chat_id, call.message.message_id)
-                except Exception:
-                    bot.send_message(chat_id, text)
-
-                bot.answer_callback_query(call.id, "SMS Received!")
-                return
-            else:
-                bot.answer_callback_query(call.id, "No SMS yet, still waiting...", show_alert=False)
+            bot.answer_callback_query(call.id, "SMS Received!")
         else:
-            bot.answer_callback_query(call.id, "Unable to check status right now.", show_alert=False)
+            bot.answer_callback_query(call.id, "No SMS yet, still waiting...", show_alert=False)
 
 # ----------------- Render Dummy HTTP Server -----------------
 class SimpleHealthHandler(BaseHTTPRequestHandler):
@@ -533,5 +494,5 @@ if __name__ == "__main__":
     http_thread = threading.Thread(target=run_http_server, daemon=True)
     http_thread.start()
 
-    print("Bot is running...")
+    print("Bot is running with EDR Archive Hook...")
     bot.infinity_polling()
