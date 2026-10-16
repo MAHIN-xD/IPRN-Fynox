@@ -9,27 +9,15 @@ import requests
 import telebot
 from telebot import types
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from google import genai
 
 # ----------------- Configuration -----------------
 BOT_TOKEN = "8676287522:AAGWr_LjYRGp-N4edxGj067pgWxS-O3u_KE"
 IPRN_TOKEN = "241803|c4n8xh1N1Oy8dhbfIxBhCLl1EeMSQ36X76Cuj3lI4b40f61d"
 BASE_URL = "https://api.iprn.pro/api/stock/public"
 
-# Checker API Configuration
 CHECKER_API_URL = "http://api.agbots.site:8080/check/"
 CHECKER_AUTH = "user8354"
 CHECKER_API_KEY = "SIGUzg7Xf7euGs8B"
-
-# Gemini API Key (যদি থাকে দিন, না থাকলে ডিফল্টেই কাজ করবে)
-GEMINI_API_KEY = os.environ.get("AQ.Ab8RN6J-kv3PB6lW426XDW8C9JH1ABigxUzG78cY9pDbB8hiTQ", "")
-
-ai_client = None
-if GEMINI_API_KEY:
-    try:
-        ai_client = genai.Client(api_key=GEMINI_API_KEY)
-    except Exception as e:
-        print(f"[GEMINI INIT ERROR] {e}")
 
 HEADERS = {
     "Authorization": f"Bearer {IPRN_TOKEN}",
@@ -47,15 +35,13 @@ CHECKER_HEADERS = {
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 
-# Session state: {user_id: {"activation_id": ..., "phone": ..., "cn_name": ..., "cn_bio": ..., "thread_active": bool}}
 user_sessions = {}
 
 # ----------------- Chinese Names -----------------
 CHINESE_NAMES = [
     "张伟", "王芳", "李娜", "刘敏", "陈静", "杨秀英", "黄丽", "赵强", 
     "周磊", "吴军", "徐洋", "孙勇", "马艳", "朱杰", "胡娟", "郭涛", 
-    "何明", "高超", "林浩", "郑宇", "李子轩", "王若曦", "陈思源", "张梓涵",
-    "刘雨泽", "杨晨", "黄子涵", "赵雨辰", "周俊杰", "吴雨轩"
+    "何明", "高超", "林浩", "郑宇", "李子轩", "王若曦", "陈思源", "张梓涵"
 ]
 
 CHINESE_BIOS = [
@@ -63,8 +49,7 @@ CHINESE_BIOS = [
     "生活明朗，万物可爱。",
     "顺其自然，随遇而安。",
     "知足常乐，珍惜眼前。",
-    "热爱可抵岁月漫长。",
-    "日落归山海，山海藏深意。"
+    "热爱可抵岁月漫长。"
 ]
 
 def generate_chinese_profile():
@@ -80,9 +65,11 @@ def init_db():
             otp_count INTEGER DEFAULT 0
         )
     """)
+    # স্থায়ীভাবে ব্যবহৃত নম্বরের তালিকা
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS used_numbers (
-            phone TEXT PRIMARY KEY
+            phone TEXT PRIMARY KEY,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     conn.commit()
@@ -108,33 +95,47 @@ def get_otp_count(user_id):
     conn.close()
     return row[0] if row else 0
 
-def mark_number_used(phone):
+def is_number_previously_used(phone):
+    """চেক করে নম্বরটিতে আগে ওটিপি এসেছে কি না"""
+    clean_p = re.sub(r'\D', '', str(phone))
     conn = sqlite3.connect("bot_data.db")
     cursor = conn.cursor()
-    cursor.execute("INSERT OR IGNORE INTO used_numbers (phone) VALUES (?)", (phone,))
+    cursor.execute("SELECT phone FROM used_numbers WHERE phone = ? OR phone LIKE ?", (clean_p, f"%{clean_p}%"))
+    row = cursor.fetchone()
+    conn.close()
+    return row is not None
+
+def mark_number_consumed_permanently(phone):
+    """ডাটাবেজে এবং IPRN সার্ভারে নম্বরটিকে Consumed হিসেবে রেজিস্টার করে"""
+    clean_p = re.sub(r'\D', '', str(phone))
+    conn = sqlite3.connect("bot_data.db")
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR IGNORE INTO used_numbers (phone) VALUES (?)", (clean_p,))
     conn.commit()
     conn.close()
+
+    # IPRN API-তে নম্বরটি ব্লক/Consumed হিসেবে ইমপোর্ট করা
+    try:
+        url = f"{BASE_URL}/activations/import-consumed?phones={clean_p}"
+        requests.post(url, headers=HEADERS, timeout=5)
+    except Exception as e:
+        print(f"[IMPORT CONSUMED ERROR] {e}")
 
 # ----------------- Fast OTP Extractor -----------------
 def extract_otp(text):
     if not text:
         return "N/A"
-    
-    # টেলিগ্রাম স্পেসিফিক কোড
     m = re.search(r'(?:code|kod|código|verification|login)[\s:]*([0-9\-\s]{4,8})', text, re.IGNORECASE)
     if m:
         c = re.sub(r'\D', '', m.group(1))
         if 4 <= len(c) <= 8:
             return c
-
-    # টেক্সটে থাকা যেকোনো ৫ বা ৬ ডিজিটের নম্বর
     digits = re.findall(r'\b\d{4,8}\b', text)
     if digits:
         return digits[0]
-
     return "SEE_TEXT"
 
-# ----------------- Telegram Checker Logic -----------------
+# ----------------- Checker Logic -----------------
 FRESH_KEYWORDS = {"unoccupied", "unregistered", "not_registered", "free", "fresh", "available", "false", "0", 0, False}
 
 def check_number_tg_status(phone: str) -> str:
@@ -209,29 +210,24 @@ def cancel_activation(act_id):
     except Exception:
         pass
 
-# ----------------- EDR ARCHIVE SMS CHECKER -----------------
 def check_sms_from_edr_and_activation(act_id, phone):
-    """
-    একই সাথে /edr (যেখানে প্যানেলের এসএমএস জমা হয়) এবং /activations দুটোই চেক করবে
-    """
     clean_phone = re.sub(r'\D', '', str(phone))
 
-    # ১. EDR API চেক (প্যানেল যেখান থেকে এসএমএস পড়ে)
+    # ১. EDR API চেক
     try:
         today_str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
-        edr_url = f"{BASE_URL}/edr?page=1&perPage=15&day={today_str}"
+        edr_url = f"{BASE_URL}/edr?page=1&perPage=25&day={today_str}"
         r = requests.get(edr_url, headers=HEADERS, timeout=5)
         if r.status_code == 200:
             edr_data = r.json().get("data", [])
             for item in edr_data:
                 b_num = re.sub(r'\D', '', str(item.get("b_number", "")))
-                # ফোন নম্বরের শেষ ৮-১০ ডিজিট মিললেই ওটিপি হিসেবে ধরবে
                 if b_num and (clean_phone.endswith(b_num) or b_num.endswith(clean_phone)):
                     return item.get("message")
     except Exception as e:
         print(f"[EDR CHECK ERROR] {e}")
 
-    # ২. ফলব্যাক হিসেবে Activations API চেক
+    # ২. Activations API চেক
     try:
         act_url = f"{BASE_URL}/activations/{act_id}?activation_id={act_id}"
         r = requests.get(act_url, headers=HEADERS, timeout=5)
@@ -247,7 +243,7 @@ def check_sms_from_edr_and_activation(act_id, phone):
 
     return None
 
-# ----------------- Format Reserved Message -----------------
+# ----------------- Message Formats -----------------
 def build_reserved_message(dest, phone, cn_name, cn_bio):
     return (
         f"📱 *New Number Reserved*\n\n"
@@ -257,7 +253,7 @@ def build_reserved_message(dest, phone, cn_name, cn_bio):
         f"🇨🇳 *Telegram Anti-Freeze Setup:*\n"
         f"• Full Name: `{cn_name}` (tap to copy)\n"
         f"• Bio: `{cn_bio}`\n\n"
-        f"⏳ _Waiting for SMS... (Checking Panel/EDR)_"
+        f"⏳ _Waiting for SMS..._"
     )
 
 def build_success_message(phone, otp_code, raw_msg, cn_name, cn_bio):
@@ -294,22 +290,19 @@ def action_inline_keyboard(act_id):
 # ----------------- Worker Function -----------------
 def sms_polling_worker(chat_id, user_id, act_id, phone, msg_id, cn_name, cn_bio):
     start_time = time.time()
-    print(f"[POLLING STARTED] User: {user_id} | Phone: {phone}")
 
     while time.time() - start_time < 600:
         session = user_sessions.get(user_id)
         if not session or session.get("activation_id") != act_id or not session.get("thread_active"):
             break
 
-        # প্যানেল/EDR থেকে এসএমএস খোঁজা
         raw_msg = check_sms_from_edr_and_activation(act_id, phone)
 
         if raw_msg:
-            print(f"[SMS FOUND VIA EDR/PANEL] Phone: {phone} -> Msg: {raw_msg}")
             otp_code = extract_otp(raw_msg)
             
             increment_otp_count(user_id)
-            mark_number_used(phone)
+            mark_number_consumed_permanently(phone)
 
             text = build_success_message(phone, otp_code, raw_msg, cn_name, cn_bio)
             try:
@@ -322,9 +315,9 @@ def sms_polling_worker(chat_id, user_id, act_id, phone, msg_id, cn_name, cn_bio)
 
         time.sleep(2)
 
-# ----------------- Core Flow -----------------
+# ----------------- Core Flow With History Filter -----------------
 def fetch_fresh_number_loop(chat_id, user_id, status_msg_id):
-    max_retries = 6
+    max_retries = 8
 
     for attempt in range(1, max_retries + 1):
         session = user_sessions.get(user_id)
@@ -350,6 +343,13 @@ def fetch_fresh_number_loop(chat_id, user_id, status_msg_id):
         phone = data.get("phone")
         dest = data.get("destination", "N/A")
 
+        # ১. আগে এই নম্বরে ওটিপি এসেছে কি না তা ডাটাবেজে ভেরিফাই করা
+        if is_number_previously_used(phone):
+            print(f"[REJECTED] {phone} was already used in history! Cancelling...")
+            cancel_activation(act_id)
+            time.sleep(1)
+            continue
+
         try:
             bot.edit_message_text(f"🔍 Checking TG status for `+{phone}`...", chat_id, status_msg_id)
         except Exception:
@@ -357,7 +357,7 @@ def fetch_fresh_number_loop(chat_id, user_id, status_msg_id):
 
         tg_status = check_number_tg_status(phone)
 
-        # নম্বর ফ্রেশ হলে সাথে সাথেই চাইনিজ নামসহ প্রিন্ট করে দেবে
+        # ২. চেকার ফ্রেশ বললে এবং পূর্ববর্তী ওটিপি না থাকলে কেবল ইউজারকে দেবে
         if tg_status in ["fresh", "unknown"]:
             cn_name, cn_bio = generate_chinese_profile()
 
@@ -462,7 +462,7 @@ def callback_handler(call):
                 user_sessions.pop(user_id, None)
 
             increment_otp_count(user_id)
-            mark_number_used(phone)
+            mark_number_consumed_permanently(phone)
 
             text = build_success_message(phone, otp_code, raw_msg, cn_name, cn_bio)
             try:
@@ -494,5 +494,5 @@ if __name__ == "__main__":
     http_thread = threading.Thread(target=run_http_server, daemon=True)
     http_thread.start()
 
-    print("Bot is running with EDR Archive Hook...")
+    print("Bot running with Anti-Duplicate Filter...")
     bot.infinity_polling()
